@@ -1,0 +1,2 @@
+# Ephemeral test workspaces (never run fluxkit init in repo root)
+tests/.work/
