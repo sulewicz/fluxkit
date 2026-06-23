@@ -1,14 +1,17 @@
 # Fluxkit
 
-Fluxkit is a single-file shell utility that wires [Flux](https://github.com/sirsjg/flux) into any local git repository. Each repo gets its own independent Kanban board stored in `.flux/data.json`, a stable local UI port, MCP integration for Cursor and Codex, and agent guidance in `AGENTS.md`.
+Fluxkit is a single-file shell utility that wires [Flux](https://github.com/sirsjg/flux) into any local git repository. Each repo gets its own independent Kanban board, a stable local UI port, MCP integration for Cursor and Codex, and agent guidance for Flux-backed work tracking.
 
 Fluxkit is language-agnostic: it only requires `git` and works with any project type.
 
 ## What it does
 
 - Creates repo-local Flux state under `.flux/`
+- Optionally creates external Flux state outside the repo with repo or branch scope
 - Generates Cursor (`.cursor/mcp.json`) and Codex (`.codex/config.toml`) MCP configs
+- In external mode, configures home-level Cursor/Codex MCP to run `fluxkit mcp`
 - Extends `AGENTS.md` with a managed Flux workflow block (never replaces your whole file)
+- In external mode, extends `~/AGENTS.md` with global Fluxkit guidance
 - Starts/stops a repo-scoped Flux UI/API server on a stable hash-based port
 - Provides a repo-local MCP launcher at `.flux/bin/mcp`
 
@@ -45,10 +48,17 @@ fluxkit ui up
 | Command | Description |
 |---------|-------------|
 | `fluxkit init` | Create or update repo-local Flux files |
+| `fluxkit init -l` | Force repo-local Flux files when external state already exists |
+| `fluxkit init -e [repo\|branch]` | Create or update external Flux files and home MCP config |
 | `fluxkit ui up` | Start Flux UI/API for this repo |
 | `fluxkit ui down` | Stop the server started by fluxkit |
+| `fluxkit ui down -t CONTAINER` | Stop a listed Fluxkit Docker UI container |
+| `fluxkit ui down -a` | Stop all running Fluxkit Docker UI containers |
 | `fluxkit ui status` | Show running/stopped state and ports |
+| `fluxkit ui list` | List running Fluxkit Docker UI containers |
 | `fluxkit port` | Print repo root, preferred port, and running URL |
+| `fluxkit mcp` | Run the repo-aware MCP server for the current repo/branch |
+| `fluxkit configured` | Report whether Fluxkit is configured for this repo/branch |
 | `fluxkit doctor` | Verify setup and suggest fixes |
 | `fluxkit help` | Show usage |
 
@@ -80,6 +90,84 @@ AGENTS.md            # Extended with managed Flux block
 .flux/*.pid
 ```
 
+## External state mode
+
+Use external mode when Flux task state should not appear in the repository or pull request history:
+
+```bash
+cd my-project
+fluxkit init -e branch
+```
+
+`branch` scope stores board data outside the repo, scoped by repository path and current git branch:
+
+```text
+${XDG_DATA_HOME:-~/.local/share}/fluxkit/repos/<repo-id>/branches/<branch-id>/.flux/
+  data.json
+  config.json
+  project.json
+
+${XDG_STATE_HOME:-~/.local/state}/fluxkit/repos/<repo-id>/branches/<branch-id>/
+  runtime.env
+  ui.log
+```
+
+The repository is left clean: no `.flux/`, `.cursor/`, `.codex/`, `.gitignore`, or repo `AGENTS.md` changes are made by `fluxkit init --external`.
+
+Each branch gets its own external `.flux/data.json`. Switching branches changes the resolved Flux board after that branch has been initialized with `fluxkit init -e branch`.
+
+Use repo scope when every branch in the same worktree should share one external board. Repo scope is the default when `-e`/`--external` has no argument:
+
+```bash
+fluxkit init -e
+# equivalent:
+fluxkit init -e repo
+```
+
+Repo-scoped external state uses:
+
+```text
+${XDG_DATA_HOME:-~/.local/share}/fluxkit/repos/<repo-id>/.flux/
+  data.json
+  config.json
+  project.json
+
+${XDG_STATE_HOME:-~/.local/state}/fluxkit/repos/<repo-id>/
+  runtime.env
+  ui.log
+```
+
+Repo-local initialization always uses repository-local `.flux/` state.
+
+If external state already exists and repo-local `.flux/` does not, `fluxkit init` refuses to create repo-local state implicitly. Run `fluxkit init -l` or `fluxkit init --local` when you explicitly want local state in that repo.
+
+When multiple setups exist for the same repo, Fluxkit resolves them in this order: repo-local `.flux/`, external branch scope, external repo scope.
+
+Agents and scripts can check the active setup with:
+
+```bash
+fluxkit configured
+```
+
+It exits zero when Fluxkit is configured for the current repo/branch and prints the resolved mode, scope, branch, data path, and MCP command. It exits non-zero when no Fluxkit setup applies.
+
+External mode configures home-level MCP entries:
+
+```text
+~/.cursor/mcp.json
+~/.codex/config.toml
+```
+
+Those entries run:
+
+```bash
+fluxkit mcp
+```
+
+`fluxkit mcp` resolves the current git repository and branch from the editor's working directory, then connects to the matching external board. If the UI/API for that repo is running, it uses remote MCP mode; otherwise it falls back to direct JSON-backed MCP via Docker.
+
+External mode also adds a managed block to `~/AGENTS.md` telling agents to use Fluxkit work tracking only when it is configured for the current repository.
+
 ## Stable ports
 
 Each git repository gets a preferred port derived from its canonical absolute path:
@@ -88,6 +176,8 @@ Each git repository gets a preferred port derived from its canonical absolute pa
 2. Resolve to a canonical absolute path
 3. SHA-256 hash → first 8 hex chars → integer
 4. `preferred_port = port_base + (hash % port_span)`
+
+For `fluxkit init -e branch`, the preferred port seed is the same canonical repository path plus the current branch name. This lets separate branch-scoped external boards prefer separate ports.
 
 Defaults: ports **42000–42999** (`port_base=42000`, `port_span=1000`).
 
@@ -123,6 +213,25 @@ FLUX_REPO_ROOT=<absolute repo root>
 
 `fluxkit ui down` stops only the PID recorded in that file, and only after verifying it looks like a `flux serve` process for this repo's data file.
 
+`fluxkit ui up` and `fluxkit ui down` use the Fluxkit setup resolved from the current git repository and branch. No target is needed for local, repo-scoped, or branch-scoped state.
+
+To inspect and stop Docker UI containers globally, even after a branch has been deleted or an external branch state path is no longer active:
+
+```bash
+fluxkit ui list
+fluxkit ui down -a
+```
+
+`fluxkit ui down -a` stops running Docker containers with Fluxkit's managed container name pattern. It does not discover API-only `FLUXKIT_UI_BACKEND=cli` processes.
+
+For `fluxkit ui down`, `-t`/`--target` accepts the Docker ID in the `CONTAINER` column from `fluxkit ui list`. It also accepts the generated Fluxkit `NAME` value for compatibility. Both forms can be run outside a git repository, and both require the container to have Fluxkit's managed Docker label:
+
+```bash
+fluxkit ui down -t 1a2b3c4d5e6f
+# or:
+fluxkit ui down -t fluxkit-<12-hex-id>
+```
+
 ## Cursor integration
 
 Fluxkit creates `.cursor/mcp.json`:
@@ -148,12 +257,14 @@ Run Codex from the repository root so `.flux/bin/mcp` resolves.
 
 ## MCP launcher behavior
 
-`.flux/bin/mcp`:
+Repo-local mode creates `.flux/bin/mcp`:
 
 1. If `.flux/runtime.env` exists and the UI/API is healthy → connect via `FLUX_SERVER` (remote MCP mode)
 2. Otherwise → fall back to direct JSON-backed MCP via Docker (`sirsjg/flux-mcp:latest`) scoped to `.flux/data.json`
 
 MCP always targets this repository's board, not global Flux state.
+
+External mode uses the global `fluxkit mcp` command instead of a repo-local launcher. It resolves the active repo/branch and targets the corresponding external `.flux/data.json`.
 
 ## AGENTS.md managed block
 

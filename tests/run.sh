@@ -8,6 +8,13 @@ WORK_ROOT="$ROOT/tests/.work"
 TMP=""
 PASS=0
 FAIL=0
+ORIG_HOME="${HOME:-}"
+ORIG_CODEX_HOME_SET=0
+ORIG_CODEX_HOME=""
+if [[ -v CODEX_HOME ]]; then
+  ORIG_CODEX_HOME_SET=1
+  ORIG_CODEX_HOME="$CODEX_HOME"
+fi
 
 mkdir -p "$WORK_ROOT"
 
@@ -123,6 +130,97 @@ MOCK
   chmod +x "$bindir/flux"
 }
 
+setup_mock_docker() {
+  local bindir="$1"
+  mkdir -p "$bindir"
+  cat >"$bindir/docker" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  info)
+    exit 0
+    ;;
+  ps)
+    shift
+    format=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --format)
+          format="$2"
+          shift 2
+          ;;
+        --filter)
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    if [[ "$format" == *'{{.Label "fluxkit.managed"}}'* && "$format" != *"{{.Ports}}"* ]]; then
+      [[ -n "${MOCK_DOCKER_PS_TARGETS:-}" ]] && printf '%s\n' "$MOCK_DOCKER_PS_TARGETS"
+    else
+      [[ -n "${MOCK_DOCKER_PS_ROWS:-}" ]] && printf '%s\n' "$MOCK_DOCKER_PS_ROWS"
+    fi
+    exit 0
+    ;;
+  inspect)
+    shift
+    format=""
+    if [[ "${1:-}" == "-f" ]]; then
+      format="$2"
+      shift 2
+    fi
+    target="${1:-}"
+    case "$format" in
+      "{{.State.Running}}")
+        if [[ "${MOCK_DOCKER_RUNNING_TARGETS:-}" == *"|$target|"* ]]; then
+          echo true
+        else
+          echo false
+        fi
+        ;;
+      "{{ index .Config.Labels \"fluxkit.managed\" }}")
+        if [[ "${MOCK_DOCKER_MANAGED_TARGETS:-}" == *"|$target|"* ]]; then
+          echo true
+        else
+          echo ""
+        fi
+        ;;
+      *)
+        if [[ -n "$target" && "${MOCK_DOCKER_INSPECT_TARGETS:-}" == *"|$target|"* ]]; then
+          echo "{}"
+        else
+          exit 1
+        fi
+        ;;
+    esac
+    exit 0
+    ;;
+  rm)
+    shift
+    if [[ "${1:-}" == "-f" ]]; then
+      shift
+    fi
+    if [[ -n "${MOCK_DOCKER_RM_LOG:-}" ]]; then
+      printf '%s\n' "$@" >>"$MOCK_DOCKER_RM_LOG"
+    fi
+    exit 0
+    ;;
+  logs)
+    exit 0
+    ;;
+  run)
+    echo "mock-container"
+    exit 0
+    ;;
+esac
+echo "mock docker: unknown args: $*" >&2
+exit 1
+MOCK
+  chmod +x "$bindir/docker"
+}
+
 FLUXKIT_NO_MAIN=1
 # shellcheck source=/dev/null
 source "$FLUXKIT"
@@ -130,6 +228,16 @@ unset FLUXKIT_NO_MAIN
 
 run_fluxkit() {
   "$FLUXKIT" "$@"
+}
+
+restore_user_env() {
+  export HOME="$ORIG_HOME"
+  unset XDG_DATA_HOME XDG_STATE_HOME
+  if (( ORIG_CODEX_HOME_SET )); then
+    export CODEX_HOME="$ORIG_CODEX_HOME"
+  else
+    unset CODEX_HOME
+  fi
 }
 
 base="${FLUXKIT_PORT_BASE:-42000}"
@@ -197,6 +305,9 @@ run_fluxkit init
 assert_file_exists ".flux/data.json"
 assert_file_exists ".flux/config.json"
 assert_file_exists ".flux/project.json"
+configured_output="$(run_fluxkit configured)"
+assert_contains "$configured_output" "configured: yes" "configured reports local setup"
+assert_contains "$configured_output" "mode: local" "configured reports local mode"
 data1="$(cat .flux/data.json)"
 run_fluxkit init
 data2="$(cat .flux/data.json)"
@@ -265,6 +376,215 @@ assert_contains "$content" '.flux/bin/mcp' "codex mcp command"
 popd >/dev/null
 rm -rf "$TMP"
 TMP=""
+
+echo "== external branch-scoped init =="
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_flux "$MOCK_BIN"
+setup_mock_docker "$MOCK_BIN"
+export FLUXKIT_FLUX_CMD="$MOCK_BIN/flux"
+export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
+export HOME="$TMP/home"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_STATE_HOME="$HOME/.local/state"
+export CODEX_HOME="$HOME/.codex"
+new_git_repo "$TMP/project"
+pushd "$TMP/project" >/dev/null
+run_fluxkit init -e branch
+if [[ ! -e .flux && ! -e .cursor && ! -e .codex && ! -e AGENTS.md && ! -e .gitignore ]]; then
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: external init should not create repo-local artifacts"
+  FAIL=$((FAIL + 1))
+fi
+data_main="$(fluxkit_data_file)"
+port_main="$(fluxkit_preferred_port)"
+assert_file_exists "$data_main" "external main branch data exists"
+assert_file_exists "$HOME/.codex/config.toml" "global codex config exists"
+assert_file_exists "$HOME/.cursor/mcp.json" "global cursor mcp exists"
+assert_file_exists "$HOME/AGENTS.md" "home AGENTS.md exists"
+assert_contains "$(cat "$(dirname "$data_main")/config.json")" '"scope": "branch"' "external branch config records scope"
+assert_contains "$(cat "$(dirname "$data_main")/config.json")" '"port_strategy": "hash_repo_path_and_branch"' "external branch config records port strategy"
+configured_output="$(run_fluxkit configured)"
+assert_contains "$configured_output" "configured: yes" "configured reports external setup"
+assert_contains "$configured_output" "mode: external" "configured reports external mode"
+assert_contains "$configured_output" "scope: branch" "configured reports branch scope"
+assert_contains "$configured_output" "mcp: fluxkit mcp" "configured reports global mcp command"
+assert_contains "$(cat "$HOME/.codex/config.toml")" 'args = ["mcp"]' "global codex uses fluxkit mcp"
+assert_contains "$(cat "$HOME/.cursor/mcp.json")" '"mcp"' "global cursor uses fluxkit mcp"
+assert_contains "$(cat "$HOME/AGENTS.md")" "BEGIN FLUXKIT GLOBAL MANAGED BLOCK" "home agents global block"
+assert_contains "$(cat "$HOME/AGENTS.md")" "fluxkit configured" "home agents tells agents to check configured status"
+branch_index=1
+while true; do
+  git checkout -q master
+  git checkout -qb "feature/work-$branch_index"
+  run_fluxkit init -e branch
+  data_feature="$(fluxkit_data_file)"
+  port_feature="$(fluxkit_preferred_port)"
+  if [[ "$port_main" != "$port_feature" ]]; then
+    break
+  fi
+  branch_index=$((branch_index + 1))
+  if (( branch_index > 20 )); then
+    break
+  fi
+done
+if [[ "$data_main" != "$data_feature" ]]; then
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: external data path should differ by branch"
+  FAIL=$((FAIL + 1))
+fi
+if [[ "$port_main" != "$port_feature" ]]; then
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: branch-scoped external preferred port should differ by branch"
+  FAIL=$((FAIL + 1))
+fi
+assert_file_exists "$data_feature" "external feature branch data exists"
+feature_container="$(fluxkit_ui_container_name)"
+git checkout -q master
+main_container="$(fluxkit_ui_container_name)"
+git checkout -q "feature/work-$branch_index"
+if [[ "$main_container" != "$feature_container" ]]; then
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: branch-scoped external UI containers should differ by branch"
+  FAIL=$((FAIL + 1))
+fi
+set +e
+run_fluxkit doctor >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "$rc" "0" "external doctor passes after init"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+restore_user_env
+unset FLUXKIT_DOCKER_CMD
+
+echo "== external repo-scoped init =="
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_flux "$MOCK_BIN"
+setup_mock_docker "$MOCK_BIN"
+export FLUXKIT_FLUX_CMD="$MOCK_BIN/flux"
+export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
+export HOME="$TMP/home"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_STATE_HOME="$HOME/.local/state"
+export CODEX_HOME="$HOME/.codex"
+new_git_repo "$TMP/project"
+pushd "$TMP/project" >/dev/null
+run_fluxkit init -e
+data_main="$(fluxkit_data_file)"
+port_main="$(fluxkit_preferred_port)"
+assert_file_exists "$data_main" "external repo-scope data exists"
+assert_contains "$(cat "$(dirname "$data_main")/config.json")" '"scope": "repo"' "external repo config records scope"
+assert_contains "$(cat "$(dirname "$data_main")/config.json")" '"port_strategy": "hash_repo_path"' "external repo config records port strategy"
+set +e
+run_fluxkit init --external=branch >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "$rc" "0" "--external=branch form is accepted"
+FLUXKIT_STATE_MODE=external
+FLUXKIT_EXTERNAL_SCOPE=repo
+data_main="$(fluxkit_data_file)"
+unset FLUXKIT_STATE_MODE FLUXKIT_EXTERNAL_SCOPE
+git checkout -qb feature/work
+data_feature="$(fluxkit_data_file)"
+port_feature="$(fluxkit_preferred_port)"
+assert_eq "$data_feature" "$data_main" "repo-scoped external data path stable across branches"
+assert_eq "$port_feature" "$port_main" "repo-scoped external preferred port stable across branches"
+run_fluxkit init -e branch
+branch_data="$(fluxkit_data_file)"
+configured_output="$(run_fluxkit configured)"
+if [[ "$branch_data" != "$data_main" ]]; then
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: branch-scoped external data should take precedence over repo-scoped data"
+  FAIL=$((FAIL + 1))
+fi
+assert_contains "$configured_output" "scope: branch" "configured reports branch precedence when both scopes exist"
+assert_contains "$configured_output" "$branch_data" "configured reports branch-precedence data path"
+set +e
+init_output="$(run_fluxkit init 2>&1)"
+rc=$?
+set -e
+assert_eq "$rc" "1" "plain init refuses to create local state when external state exists"
+assert_contains "$init_output" "fluxkit init --local" "plain init tells user how to force local state"
+if [[ ! -e .flux ]]; then
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: refused local init should not create .flux"
+  FAIL=$((FAIL + 1))
+fi
+run_fluxkit init -l
+assert_file_exists ".flux/data.json" "forced local init creates repo-local data"
+configured_output="$(run_fluxkit configured)"
+assert_contains "$configured_output" "mode: local" "local state takes precedence over external branch and repo state"
+assert_eq "$(fluxkit_data_file)" "$PWD/.flux/data.json" "local data path takes precedence when local and external state exist"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+restore_user_env
+unset FLUXKIT_DOCKER_CMD
+
+echo "== configured before init =="
+TMP="$(new_work_dir)"
+new_git_repo "$TMP/project"
+pushd "$TMP/project" >/dev/null
+set +e
+run_fluxkit configured >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "$rc" "1" "configured fails before init"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+
+echo "== global UI container management =="
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_docker "$MOCK_BIN"
+export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
+export MOCK_DOCKER_PS_ROWS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\t127.0.0.1:42001->42001/tcp\ttrue\texternal\tbranch\told-branch\t/repo-a\t/data-a\ncccccccccccc\tfluxkit-cccccccccccc\t127.0.0.1:42003->42003/tcp\tfalse\texternal\tbranch\told-branch\t/repo-c\t/data-c\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\t127.0.0.1:42002->42002/tcp\ttrue\tlocal\t\tmain\t/repo-b\t/data-b\nshortshort12\tfluxkit-short\t127.0.0.1:42004->42004/tcp\ttrue\tlocal\t\tmain\t/repo-d\t/data-d\nnotflux12345\tnot-fluxkit\t127.0.0.1:43000->43000/tcp\ttrue\t\t\t\t\t'
+export MOCK_DOCKER_PS_TARGETS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\ttrue\ncccccccccccc\tfluxkit-cccccccccccc\tfalse\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\ttrue\nshortshort12\tfluxkit-short\ttrue\nnotflux12345\tnot-fluxkit\ttrue'
+export MOCK_DOCKER_MANAGED_TARGETS="|aaaaaaaaaaaa|fluxkit-aaaaaaaaaaaa|bbbbbbbbbbbb|fluxkit-bbbbbbbbbbbb|"
+export MOCK_DOCKER_RM_LOG="$TMP/rm.log"
+pushd "$TMP" >/dev/null
+list_output="$(run_fluxkit ui list)"
+assert_contains "$list_output" "aaaaaaaaaaaa" "ui list includes first fluxkit container ID"
+assert_contains "$list_output" "fluxkit-aaaaaaaaaaaa" "ui list includes first fluxkit container name"
+assert_contains "$list_output" "old-branch" "ui list includes branch label"
+assert_contains "$list_output" "fluxkit-bbbbbbbbbbbb" "ui list includes second fluxkit container"
+assert_not_contains "$list_output" "not-fluxkit" "ui list excludes non-matching containers"
+assert_not_contains "$list_output" "fluxkit-short" "ui list excludes invalid fluxkit names"
+assert_not_contains "$list_output" "fluxkit-cccccccccccc" "ui list excludes unmanaged fluxkit-looking containers"
+run_fluxkit ui down -t aaaaaaaaaaaa >/dev/null
+rm_log="$(cat "$MOCK_DOCKER_RM_LOG")"
+assert_contains "$rm_log" "aaaaaaaaaaaa" "ui down -t stops selected CONTAINER ID"
+assert_not_contains "$rm_log" "bbbbbbbbbbbb" "ui down -t does not stop other containers"
+run_fluxkit ui down -t fluxkit-bbbbbbbbbbbb >/dev/null
+rm_log="$(cat "$MOCK_DOCKER_RM_LOG")"
+assert_contains "$rm_log" "fluxkit-bbbbbbbbbbbb" "ui down -t accepts selected Fluxkit NAME value"
+set +e
+run_fluxkit ui down -t cccccccccccc >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "$rc" "1" "ui down -t refuses unmanaged fluxkit-looking container"
+: >"$MOCK_DOCKER_RM_LOG"
+run_fluxkit ui down -a >/dev/null
+rm_log="$(cat "$MOCK_DOCKER_RM_LOG")"
+assert_contains "$rm_log" "aaaaaaaaaaaa" "ui down --all stops first fluxkit container"
+assert_contains "$rm_log" "bbbbbbbbbbbb" "ui down --all stops second fluxkit container"
+assert_not_contains "$rm_log" "not-fluxkit" "ui down --all skips non-matching containers"
+assert_not_contains "$rm_log" "fluxkit-short" "ui down --all skips invalid fluxkit names"
+assert_not_contains "$rm_log" "cccccccccccc" "ui down --all skips unmanaged fluxkit-looking containers"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+unset FLUXKIT_DOCKER_CMD MOCK_DOCKER_PS_ROWS MOCK_DOCKER_PS_TARGETS MOCK_DOCKER_MANAGED_TARGETS MOCK_DOCKER_RM_LOG
 
 echo "== AGENTS.md creation when missing =="
 TMP="$(new_work_dir)"
@@ -368,7 +688,9 @@ echo "== doctor checks =="
 TMP="$(new_work_dir)"
 MOCK_BIN="$TMP/bin"
 setup_mock_flux "$MOCK_BIN"
+setup_mock_docker "$MOCK_BIN"
 export FLUXKIT_FLUX_CMD="$MOCK_BIN/flux"
+export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
 new_git_repo "$TMP/project"
 pushd "$TMP/project" >/dev/null
 set +e
@@ -385,6 +707,7 @@ assert_eq "$rc" "0" "doctor passes after init"
 popd >/dev/null
 rm -rf "$TMP"
 TMP=""
+unset FLUXKIT_DOCKER_CMD
 
 echo "== safe ui down refuses unrelated PID =="
 TMP="$(new_work_dir)"

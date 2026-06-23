@@ -18,6 +18,8 @@ FLUXKIT_PORT_SPAN="${FLUXKIT_PORT_SPAN:-1000}"
 
 AGENTS_BEGIN='<!-- BEGIN FLUXKIT MANAGED BLOCK -->'
 AGENTS_END='<!-- END FLUXKIT MANAGED BLOCK -->'
+GLOBAL_AGENTS_BEGIN='<!-- BEGIN FLUXKIT GLOBAL MANAGED BLOCK -->'
+GLOBAL_AGENTS_END='<!-- END FLUXKIT GLOBAL MANAGED BLOCK -->'
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -70,23 +72,200 @@ fluxkit_canonical_path() {
   fi
 }
 
+fluxkit_json_quote() {
+  local value="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$value"
+  else
+    printf '"%s"' "$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  fi
+}
+
+fluxkit_home_dir() {
+  [[ -n "${HOME:-}" ]] || fluxkit_die "HOME is not set"
+  echo "$HOME"
+}
+
+fluxkit_xdg_data_home() {
+  echo "${XDG_DATA_HOME:-$(fluxkit_home_dir)/.local/share}"
+}
+
+fluxkit_xdg_state_home() {
+  echo "${XDG_STATE_HOME:-$(fluxkit_home_dir)/.local/state}"
+}
+
+fluxkit_safe_slug() {
+  local value="$1" slug
+  slug="$(printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-60)"
+  [[ -n "$slug" ]] || slug="item"
+  echo "$slug"
+}
+
+fluxkit_repo_id() {
+  local root canonical hash name
+  root="$(fluxkit_repo_root)"
+  canonical="$(fluxkit_canonical_path "$root")"
+  hash="$(fluxkit_sha256 "$canonical")"
+  name="$(fluxkit_safe_slug "$(basename "$root")")"
+  echo "${name}-${hash:0:12}"
+}
+
+fluxkit_branch_name() {
+  local branch
+  branch="$(git branch --show-current 2>/dev/null || true)"
+  if [[ -n "$branch" ]]; then
+    echo "$branch"
+  else
+    echo "detached-$(git rev-parse --short HEAD)"
+  fi
+}
+
+fluxkit_branch_id() {
+  local branch hash slug
+  branch="$(fluxkit_branch_name)"
+  hash="$(fluxkit_sha256 "$branch")"
+  slug="$(fluxkit_safe_slug "$branch")"
+  echo "${slug}-${hash:0:12}"
+}
+
+fluxkit_external_repo_dir() {
+  echo "$(fluxkit_xdg_data_home)/fluxkit/repos/$(fluxkit_repo_id)"
+}
+
+fluxkit_external_state_repo_dir() {
+  echo "$(fluxkit_xdg_state_home)/fluxkit/repos/$(fluxkit_repo_id)"
+}
+
+fluxkit_external_scope() {
+  case "${FLUXKIT_EXTERNAL_SCOPE:-}" in
+    repo|branch)
+      echo "$FLUXKIT_EXTERNAL_SCOPE"
+      return 0
+      ;;
+    "")
+      ;;
+    *)
+      fluxkit_die "unknown FLUXKIT_EXTERNAL_SCOPE: $FLUXKIT_EXTERNAL_SCOPE (use repo or branch)"
+      ;;
+  esac
+
+  if [[ -f "$(fluxkit_external_repo_dir)/branches/$(fluxkit_branch_id)/.flux/config.json" ]]; then
+    echo "branch"
+  elif [[ -f "$(fluxkit_external_repo_dir)/.flux/config.json" ]]; then
+    echo "repo"
+  else
+    echo "repo"
+  fi
+}
+
+fluxkit_external_configured() {
+  local dir
+  dir="$(fluxkit_external_flux_dir)"
+  [[ -f "$dir/config.json" && -f "$dir/data.json" ]]
+}
+
+fluxkit_external_flux_dir() {
+  if [[ "$(fluxkit_external_scope)" == "repo" ]]; then
+    echo "$(fluxkit_external_repo_dir)/.flux"
+  else
+    echo "$(fluxkit_external_repo_dir)/branches/$(fluxkit_branch_id)/.flux"
+  fi
+}
+
+fluxkit_external_runtime_dir() {
+  if [[ "$(fluxkit_external_scope)" == "repo" ]]; then
+    echo "$(fluxkit_external_state_repo_dir)"
+  else
+    echo "$(fluxkit_external_state_repo_dir)/branches/$(fluxkit_branch_id)"
+  fi
+}
+
+fluxkit_state_mode() {
+  case "${FLUXKIT_STATE_MODE:-}" in
+    local|external)
+      echo "$FLUXKIT_STATE_MODE"
+      return 0
+      ;;
+    "")
+      ;;
+    *)
+      fluxkit_die "unknown FLUXKIT_STATE_MODE: $FLUXKIT_STATE_MODE (use local or external)"
+      ;;
+  esac
+
+  if fluxkit_local_configured; then
+    echo "local"
+  elif fluxkit_external_configured; then
+    echo "external"
+  else
+    echo "local"
+  fi
+}
+
 fluxkit_flux_dir() {
-  echo "$(fluxkit_repo_root)/.flux"
+  if [[ "$(fluxkit_state_mode)" == "external" ]]; then
+    echo "$(fluxkit_external_flux_dir)"
+  else
+    echo "$(fluxkit_repo_root)/.flux"
+  fi
 }
 
 fluxkit_data_file() {
   echo "$(fluxkit_flux_dir)/data.json"
 }
 
+fluxkit_local_flux_dir() {
+  echo "$(fluxkit_repo_root)/.flux"
+}
+
+fluxkit_local_configured() {
+  local dir
+  dir="$(fluxkit_local_flux_dir)"
+  [[ -f "$dir/config.json" && -f "$dir/data.json" ]]
+}
+
 fluxkit_runtime_env() {
-  echo "$(fluxkit_flux_dir)/runtime.env"
+  if [[ "$(fluxkit_state_mode)" == "external" ]]; then
+    echo "$(fluxkit_external_runtime_dir)/runtime.env"
+  else
+    echo "$(fluxkit_flux_dir)/runtime.env"
+  fi
+}
+
+fluxkit_ui_log_file() {
+  if [[ "$(fluxkit_state_mode)" == "external" ]]; then
+    echo "$(fluxkit_external_runtime_dir)/ui.log"
+  else
+    echo "$(fluxkit_flux_dir)/ui.log"
+  fi
+}
+
+fluxkit_state_desc() {
+  if [[ "$(fluxkit_state_mode)" == "external" ]]; then
+    if [[ "$(fluxkit_external_scope)" == "branch" ]]; then
+      echo "external branch $(fluxkit_branch_name)"
+    else
+      echo "external repo"
+    fi
+  else
+    echo "local"
+  fi
+}
+
+fluxkit_ui_seed() {
+  local root canonical seed
+  root="$(fluxkit_repo_root)"
+  canonical="$(fluxkit_canonical_path "$root")"
+  seed="$canonical"
+  if [[ "$(fluxkit_state_mode)" == "external" && "$(fluxkit_external_scope)" == "branch" ]]; then
+    seed="${canonical}#branch:$(fluxkit_branch_name)"
+  fi
+  echo "$seed"
 }
 
 fluxkit_preferred_port() {
-  local root canonical hash_int hash_hex offset base span
-  root="$(fluxkit_repo_root)"
-  canonical="$(fluxkit_canonical_path "$root")"
-  hash_hex="$(fluxkit_sha256 "$canonical")"
+  local hash_int hash_hex offset base span
+  hash_hex="$(fluxkit_sha256 "$(fluxkit_ui_seed)")"
   hash_int="$((16#${hash_hex:0:8}))"
   base="${FLUXKIT_PORT_BASE}"
   span="${FLUXKIT_PORT_SPAN}"
@@ -104,11 +283,24 @@ fluxkit_port_in_use() {
   (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
 }
 
+fluxkit_path_is_inside() {
+  local path="$1" parent="$2"
+  path="$(fluxkit_canonical_path "$path")"
+  parent="$(fluxkit_canonical_path "$parent")"
+  [[ "$path" == "$parent" || "$path" == "$parent"/* ]]
+}
+
 fluxkit_read_runtime_env() {
   local file="$1"
   [[ -f "$file" ]] || return 1
-  # shellcheck disable=SC1090
-  source "$file"
+  grep -E '^[A-Z0-9_]+=' "$file" >/dev/null 2>&1
+}
+
+fluxkit_runtime_get() {
+  local file="$1" key="$2" line
+  [[ -f "$file" ]] || return 0
+  line="$(grep -E "^${key}=" "$file" 2>/dev/null | head -1 || true)"
+  printf '%s' "${line#*=}"
 }
 
 fluxkit_process_cmdline() {
@@ -136,10 +328,17 @@ fluxkit_is_flux_serve_process() {
 }
 
 fluxkit_ui_container_name() {
-  local canonical hash
-  canonical="$(fluxkit_canonical_path "$(fluxkit_repo_root)")"
-  hash="$(fluxkit_sha256 "$canonical")"
+  local hash
+  hash="$(fluxkit_sha256 "$(fluxkit_ui_seed)")"
   echo "fluxkit-${hash:0:12}"
+}
+
+fluxkit_is_fluxkit_container_name() {
+  [[ "$1" =~ ^fluxkit-[0-9a-f]{12}$ ]]
+}
+
+fluxkit_is_docker_container_id() {
+  [[ "$1" =~ ^[0-9a-fA-F]{12,64}$ ]]
 }
 
 fluxkit_docker_container_running() {
@@ -147,6 +346,48 @@ fluxkit_docker_container_running() {
   [[ -n "$name" ]] || return 1
   docker_cmd="$(fluxkit_find_docker 2>/dev/null || return 1)"
   [[ "$("$docker_cmd" inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)" == "true" ]]
+}
+
+fluxkit_docker_container_managed() {
+  local target="$1" docker_cmd
+  [[ -n "$target" ]] || return 1
+  docker_cmd="$(fluxkit_find_docker 2>/dev/null || return 1)"
+  [[ "$("$docker_cmd" inspect -f '{{ index .Config.Labels "fluxkit.managed" }}' "$target" 2>/dev/null || true)" == "true" ]]
+}
+
+fluxkit_docker_fluxkit_container_targets() {
+  local docker_cmd="$1" id name managed
+  "$docker_cmd" ps --filter "label=fluxkit.managed=true" --format '{{.ID}}\t{{.Names}}\t{{.Label "fluxkit.managed"}}' 2>/dev/null |
+    while IFS=$'\t' read -r id name managed; do
+      [[ "$managed" == "true" ]] || continue
+      fluxkit_is_fluxkit_container_name "$name" || continue
+      [[ -n "$id" ]] || continue
+      printf '%s\n' "$id"
+    done
+}
+
+fluxkit_docker_fluxkit_container_rows() {
+  local docker_cmd="$1"
+  local id name ports managed mode scope branch repo data
+  "$docker_cmd" ps --filter "label=fluxkit.managed=true" --format '{{.ID}}\t{{.Names}}\t{{.Ports}}\t{{.Label "fluxkit.managed"}}\t{{.Label "fluxkit.state_mode"}}\t{{.Label "fluxkit.external_scope"}}\t{{.Label "fluxkit.branch"}}\t{{.Label "fluxkit.repo_root"}}\t{{.Label "fluxkit.data_file"}}' 2>/dev/null |
+    while IFS=$'\t' read -r id name ports managed mode scope branch repo data; do
+      [[ "$managed" == "true" ]] || continue
+      fluxkit_is_fluxkit_container_name "$name" || continue
+      [[ -n "$id" ]] || continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$id" "$name" "${ports:-n/a}" "${mode:-unknown}" "${scope:-n/a}" "${branch:-n/a}" "${repo:-n/a}" "${data:-n/a}"
+    done
+}
+
+fluxkit_stop_docker_ui_container() {
+  local target="$1" docker_cmd
+  fluxkit_is_fluxkit_container_name "$target" || fluxkit_is_docker_container_id "$target" || \
+    fluxkit_die "invalid Fluxkit container: $target (use a CONTAINER value from 'fluxkit ui list')"
+  docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
+  fluxkit_docker_daemon_ready || fluxkit_die "Docker daemon not reachable (check: docker info)"
+  fluxkit_docker_container_managed "$target" || fluxkit_die "container $target is not managed by Fluxkit"
+  "$docker_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
+  fluxkit_info "stopped Flux UI (docker: $target)"
 }
 
 fluxkit_flux_cli_runnable() {
@@ -194,8 +435,10 @@ fluxkit_find_ui_port() {
 
   # 2. Preferred port serves this repo's Flux UI
   if fluxkit_runtime_matches_repo "$runtime_file" "$repo_root"; then
-    # shellcheck disable=SC1090
-    source "$runtime_file"
+    FLUX_UI_PORT="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PORT)"
+    FLUX_UI_BACKEND="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_BACKEND)"
+    FLUX_UI_CONTAINER="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER)"
+    FLUX_UI_PID="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PID)"
     if [[ "${FLUX_UI_PORT:-}" == "$preferred" ]]; then
       if [[ "${FLUX_UI_BACKEND:-cli}" == "docker" ]]; then
         if fluxkit_docker_container_running "${FLUX_UI_CONTAINER:-}"; then
@@ -312,6 +555,27 @@ Do not use global Flux state for this repository.
 EOF
 }
 
+fluxkit_global_agents_managed_content() {
+  cat <<'EOF'
+<!-- BEGIN FLUXKIT GLOBAL MANAGED BLOCK -->
+## Fluxkit work tracking
+
+When working inside a git repository, run `fluxkit configured` before using ad
+hoc task tracking.
+
+If `fluxkit configured` exits successfully, use the reported MCP command for
+Flux task reads and writes. For external setups this is `fluxkit mcp`; for
+repo-local setups this may be `.flux/bin/mcp`. Do not read or edit Fluxkit
+storage files directly. The storage may be repository-local or external to the
+repository.
+
+If `fluxkit configured` reports `configured: no` or exits non-zero, do not
+invent a Flux project or task ID. Ask the user whether they want Fluxkit
+initialized.
+<!-- END FLUXKIT GLOBAL MANAGED BLOCK -->
+EOF
+}
+
 fluxkit_update_agents_md() {
   local agents_file="$1"
   local begin_line end_line tmp
@@ -347,10 +611,52 @@ fluxkit_update_agents_md() {
   fluxkit_die "AGENTS.md managed block markers are malformed (found only one of begin/end)"
 }
 
+fluxkit_update_home_agents_md() {
+  local agents_file="$1"
+  local begin_line end_line tmp
+  begin_line="$(grep -Fn "$GLOBAL_AGENTS_BEGIN" "$agents_file" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+  end_line="$(grep -Fn "$GLOBAL_AGENTS_END" "$agents_file" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+
+  if [[ -z "$begin_line" && -z "$end_line" ]]; then
+    mkdir -p "$(dirname "$agents_file")"
+    if [[ ! -s "$agents_file" ]]; then
+      fluxkit_global_agents_managed_content >"$agents_file"
+    else
+      printf '\n' >>"$agents_file"
+      fluxkit_global_agents_managed_content >>"$agents_file"
+    fi
+    return 0
+  fi
+
+  if [[ -n "$begin_line" && -n "$end_line" ]]; then
+    if (( begin_line >= end_line )); then
+      fluxkit_die "$agents_file Fluxkit global managed block markers are malformed (begin must precede end)"
+    fi
+    tmp="$(mktemp)"
+    {
+      if (( begin_line > 1 )); then
+        head -n $((begin_line - 1)) "$agents_file"
+      fi
+      fluxkit_global_agents_managed_content
+      tail -n +$((end_line + 1)) "$agents_file"
+    } >"$tmp"
+    mv "$tmp" "$agents_file"
+    return 0
+  fi
+
+  fluxkit_die "$agents_file Fluxkit global managed block markers are malformed (found only one of begin/end)"
+}
+
 fluxkit_agents_block_valid() {
   local agents_file="$1"
   [[ -f "$agents_file" ]] || return 1
   grep -Fq "$AGENTS_BEGIN" "$agents_file" && grep -Fq "$AGENTS_END" "$agents_file"
+}
+
+fluxkit_global_agents_block_valid() {
+  local agents_file="$1"
+  [[ -f "$agents_file" ]] || return 1
+  grep -Fq "$GLOBAL_AGENTS_BEGIN" "$agents_file" && grep -Fq "$GLOBAL_AGENTS_END" "$agents_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -427,6 +733,13 @@ RUNTIME_ENV="\$FLUX_DIR/runtime.env"
 DATA_FILE="\$FLUX_DIR/data.json"
 FLUX_DOCKER_IMAGE="$FLUX_DOCKER_IMAGE"
 
+runtime_get() {
+  local file="\$1" key="\$2" line
+  [[ -f "\$file" ]] || return 0
+  line="\$(grep -E "^\${key}=" "\$file" 2>/dev/null | head -1 || true)"
+  printf '%s' "\${line#*=}"
+}
+
 run_mcp_docker() {
   local docker_cmd mode="\$1"
   shift
@@ -457,8 +770,7 @@ run_mcp_docker() {
 }
 
 if [[ -f "\$RUNTIME_ENV" ]]; then
-  # shellcheck disable=SC1090
-  source "\$RUNTIME_ENV"
+  FLUX_SERVER="\$(runtime_get "\$RUNTIME_ENV" FLUX_SERVER)"
   if [[ -n "\${FLUX_SERVER:-}" ]]; then
     if command -v curl >/dev/null 2>&1 && curl -sf --max-time 2 "\${FLUX_SERVER%/}/api/projects" >/dev/null 2>&1; then
       export FLUX_SERVER
@@ -558,6 +870,153 @@ EOF
   fi
 }
 
+fluxkit_global_mcp_command() {
+  local found source_path
+  source_path="${BASH_SOURCE[0]}"
+  if [[ "$source_path" == */* && "$source_path" != /* ]]; then
+    source_path="$(pwd)/$source_path"
+  fi
+  if [[ "$source_path" == /* && -x "$source_path" ]]; then
+    fluxkit_canonical_path "$source_path"
+    return 0
+  fi
+
+  found="$(command -v fluxkit 2>/dev/null || true)"
+  if [[ -n "$found" ]]; then
+    echo "$found"
+    return 0
+  fi
+
+  fluxkit_die "cannot locate fluxkit command for global MCP config"
+}
+
+fluxkit_global_codex_config_file() {
+  echo "${CODEX_HOME:-$(fluxkit_home_dir)/.codex}/config.toml"
+}
+
+fluxkit_global_cursor_mcp_file() {
+  echo "$(fluxkit_home_dir)/.cursor/mcp.json"
+}
+
+fluxkit_home_agents_file() {
+  echo "$(fluxkit_home_dir)/AGENTS.md"
+}
+
+fluxkit_write_global_codex_config() {
+  local config_toml command_json
+  config_toml="$(fluxkit_global_codex_config_file)"
+  command_json="$(fluxkit_json_quote "$(fluxkit_global_mcp_command)")"
+  mkdir -p "$(dirname "$config_toml")"
+
+  if [[ ! -f "$config_toml" ]]; then
+    cat >"$config_toml" <<EOF
+[mcp_servers.flux]
+command = ${command_json}
+args = ["mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+EOF
+  elif ! grep -q '\[mcp_servers\.flux\]' "$config_toml" 2>/dev/null; then
+    cat >>"$config_toml" <<EOF
+
+[mcp_servers.flux]
+command = ${command_json}
+args = ["mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+EOF
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$config_toml" "$command_json" <<'PY'
+import re, sys
+path, command_json = sys.argv[1], sys.argv[2]
+block = f"""[mcp_servers.flux]
+command = {command_json}
+args = ["mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+"""
+with open(path) as f:
+    text = f.read()
+pattern = r"(?ms)^\[mcp_servers\.flux\]\n.*?(?=^\[|\Z)"
+text = re.sub(pattern, block, text, count=1)
+with open(path, "w") as f:
+    f.write(text)
+    if text and not text.endswith("\n"):
+        f.write("\n")
+PY
+  else
+    fluxkit_warn "$config_toml already contains [mcp_servers.flux]; leaving it unchanged because python3 is unavailable"
+  fi
+}
+
+fluxkit_write_global_cursor_mcp() {
+  local mcp_json command
+  mcp_json="$(fluxkit_global_cursor_mcp_file)"
+  command="$(fluxkit_global_mcp_command)"
+  mkdir -p "$(dirname "$mcp_json")"
+
+  if [[ ! -f "$mcp_json" ]]; then
+    cat >"$mcp_json" <<EOF
+{
+  "mcpServers": {
+    "flux": {
+      "type": "stdio",
+      "command": $(fluxkit_json_quote "$command"),
+      "args": ["mcp"]
+    }
+  }
+}
+EOF
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$mcp_json" "$command" <<'PY'
+import json, sys
+path, command = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+data.setdefault("mcpServers", {})["flux"] = {
+    "type": "stdio",
+    "command": command,
+    "args": ["mcp"],
+}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+    return 0
+  fi
+
+  if grep -q '"flux"' "$mcp_json" 2>/dev/null; then
+    fluxkit_warn "$mcp_json already contains a flux entry; leaving it unchanged because python3 is unavailable"
+  else
+    fluxkit_warn "$mcp_json exists; add the fluxkit mcp entry manually or install python3 for auto-merge"
+  fi
+}
+
+fluxkit_write_global_integrations() {
+  fluxkit_write_global_codex_config
+  fluxkit_write_global_cursor_mcp
+  fluxkit_update_home_agents_md "$(fluxkit_home_agents_file)"
+}
+
+fluxkit_global_codex_configured() {
+  local config_toml
+  config_toml="$(fluxkit_global_codex_config_file)"
+  [[ -f "$config_toml" ]] &&
+    grep -q '\[mcp_servers\.flux\]' "$config_toml" 2>/dev/null &&
+    grep -q 'args = \["mcp"\]' "$config_toml" 2>/dev/null
+}
+
+fluxkit_global_cursor_configured() {
+  local mcp_json
+  mcp_json="$(fluxkit_global_cursor_mcp_file)"
+  [[ -f "$mcp_json" ]] &&
+    grep -q '"flux"' "$mcp_json" 2>/dev/null &&
+    grep -q '"mcp"' "$mcp_json" 2>/dev/null
+}
+
 fluxkit_discover_project_id() {
   local flux_cmd project_id
   flux_cmd="$(fluxkit_find_flux_cli 2>/dev/null || true)"
@@ -567,11 +1026,129 @@ fluxkit_discover_project_id() {
 }
 
 fluxkit_cmd_init() {
-  local root flux_dir repo_name project_id
+  local root flux_dir repo_name project_id project_id_json
+  local external=0 external_scope="repo" local_force=0
+  local branch_name canonical repo_id branch_id repo_name_json branch_name_json canonical_json repo_id_json branch_id_json project_name project_name_json scope_json port_strategy
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --external|-e)
+        external=1
+        local_force=0
+        if [[ $# -ge 2 && ( "$2" == "repo" || "$2" == "branch" ) ]]; then
+          external_scope="$2"
+          shift
+        fi
+        ;;
+      --external=*)
+        external=1
+        local_force=0
+        external_scope="${1#--external=}"
+        ;;
+      -e=*)
+        external=1
+        local_force=0
+        external_scope="${1#-e=}"
+        ;;
+      --local|-l)
+        external=0
+        local_force=1
+        ;;
+      *)
+        fluxkit_die "unknown init option: $1 (use [-e | --external] [repo|branch], [-l | --local], or no options)"
+        ;;
+    esac
+    shift
+  done
+
+  case "$external_scope" in
+    repo|branch) ;;
+    *) fluxkit_die "unknown init scope: $external_scope (use repo or branch)" ;;
+  esac
+
   fluxkit_require_git
+
   root="$(fluxkit_repo_root)"
-  flux_dir="$(fluxkit_flux_dir)"
   repo_name="$(basename "$root")"
+  branch_name="$(fluxkit_branch_name)"
+  canonical="$(fluxkit_canonical_path "$root")"
+
+  if (( external )); then
+    FLUXKIT_STATE_MODE=external
+    FLUXKIT_EXTERNAL_SCOPE="$external_scope"
+    flux_dir="$(fluxkit_external_flux_dir)"
+    repo_id="$(fluxkit_repo_id)"
+    branch_id="$(fluxkit_branch_id)"
+    repo_name_json="$(fluxkit_json_quote "$repo_name")"
+    branch_name_json="$(fluxkit_json_quote "$branch_name")"
+    canonical_json="$(fluxkit_json_quote "$canonical")"
+    repo_id_json="$(fluxkit_json_quote "$repo_id")"
+    branch_id_json="$(fluxkit_json_quote "$branch_id")"
+    scope_json="$(fluxkit_json_quote "$external_scope")"
+    if [[ "$external_scope" == "branch" ]]; then
+      port_strategy="hash_repo_path_and_branch"
+    else
+      port_strategy="hash_repo_path"
+    fi
+    mkdir -p "$flux_dir"
+
+    fluxkit_write_json_if_missing "$(fluxkit_data_file)" '{"projects":[],"epics":[],"tasks":[]}'
+
+    fluxkit_write_json_if_missing "$flux_dir/config.json" "$(cat <<EOF
+{
+  "storage": "external",
+  "scope": ${scope_json},
+  "data": ".flux/data.json",
+  "repo": {
+    "name": ${repo_name_json},
+    "root": ${canonical_json},
+    "id": ${repo_id_json}
+  },
+  "branch": {
+    "name": ${branch_name_json},
+    "id": ${branch_id_json}
+  },
+  "ui": {
+    "host": "127.0.0.1",
+    "port_strategy": "${port_strategy}",
+    "port_base": ${FLUXKIT_PORT_BASE},
+    "port_span": ${FLUXKIT_PORT_SPAN}
+  }
+}
+EOF
+)"
+
+    if [[ ! -f "$flux_dir/project.json" ]]; then
+      project_name="${repo_name}:${branch_name}"
+      project_name_json="$(fluxkit_json_quote "$project_name")"
+      cat >"$flux_dir/project.json" <<EOF
+{
+  "name": ${project_name_json},
+  "project_id": null,
+  "repo_root": ${canonical_json},
+  "branch": ${branch_name_json},
+  "created_by": "fluxkit"
+}
+EOF
+    fi
+
+    fluxkit_write_global_integrations
+
+    fluxkit_info "initialized external Flux state for $canonical"
+    fluxkit_info "branch: $branch_name"
+    fluxkit_info "data: $(fluxkit_data_file)"
+    fluxkit_info "global MCP: fluxkit mcp"
+    return 0
+  fi
+
+  if ! (( local_force )) && ! fluxkit_local_configured && fluxkit_external_configured; then
+    fluxkit_warn "external Flux state is already configured for this repo/branch"
+    fluxkit_die "run 'fluxkit init --local' or 'fluxkit init -l' to create repo-local .flux state anyway"
+  fi
+
+  FLUXKIT_STATE_MODE=local
+  unset FLUXKIT_EXTERNAL_SCOPE
+  flux_dir="$(fluxkit_local_flux_dir)"
 
   mkdir -p "$flux_dir/bin" "$root/.cursor" "$root/.codex"
 
@@ -593,14 +1170,15 @@ EOF
   if [[ ! -f "$flux_dir/project.json" ]]; then
     project_id="$(fluxkit_discover_project_id || true)"
     if [[ -z "$project_id" ]]; then
-      project_id="null"
+      project_id_json="null"
     else
-      project_id="\"$project_id\""
+      project_id_json="$(fluxkit_json_quote "$project_id")"
     fi
+    repo_name_json="$(fluxkit_json_quote "$repo_name")"
     cat >"$flux_dir/project.json" <<EOF
 {
-  "name": "$repo_name",
-  "project_id": $project_id,
+  "name": ${repo_name_json},
+  "project_id": ${project_id_json},
   "created_by": "fluxkit"
 }
 EOF
@@ -623,6 +1201,139 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# MCP command
+# ---------------------------------------------------------------------------
+
+fluxkit_run_mcp_docker() {
+  local mode="$1" docker_cmd repo_root flux_dir data_file
+  local volume_args=()
+  shift || true
+
+  docker_cmd="$(fluxkit_find_docker 2>/dev/null || true)"
+  [[ -n "$docker_cmd" ]] || {
+    echo "flux-mcp: docker required for MCP (image: $FLUX_DOCKER_IMAGE)" >&2
+    echo "flux-mcp: run: fluxkit ui up  (starts UI + enables remote MCP mode)" >&2
+    exit 1
+  }
+  if ! "$docker_cmd" info >/dev/null 2>&1; then
+    echo "flux-mcp: docker daemon not reachable (check: docker info)" >&2
+    exit 1
+  fi
+
+  if [[ "$mode" == "remote" ]]; then
+    exec "$docker_cmd" run -i --rm \
+      --network host \
+      -e "FLUX_SERVER=$FLUX_SERVER" \
+      "$FLUX_DOCKER_IMAGE" \
+      bun /app/packages/mcp/dist/index.js
+  fi
+
+  repo_root="$(fluxkit_repo_root)"
+  flux_dir="$(fluxkit_flux_dir)"
+  data_file="$(fluxkit_data_file)"
+
+  volume_args=(-v "${repo_root}:${repo_root}")
+  if ! fluxkit_path_is_inside "$flux_dir" "$repo_root"; then
+    volume_args+=(-v "${flux_dir}:${flux_dir}")
+  fi
+
+  exec "$docker_cmd" run -i --rm \
+    --user "$(id -u):$(id -g)" \
+    "${volume_args[@]}" \
+    -e "FLUX_DIR=${flux_dir}" \
+    -e "FLUX_DATA=${data_file}" \
+    "$FLUX_DOCKER_IMAGE" \
+    bun /app/packages/mcp/dist/index.js
+}
+
+fluxkit_cmd_mcp() {
+  local runtime_file data_file
+  fluxkit_require_git
+  data_file="$(fluxkit_data_file)"
+  [[ -f "$data_file" ]] || fluxkit_die "Fluxkit is not initialized for this repo/branch; run: fluxkit init --external"
+
+  runtime_file="$(fluxkit_runtime_env)"
+  if [[ -f "$runtime_file" ]] && fluxkit_runtime_matches_repo "$runtime_file" "$(fluxkit_repo_root)"; then
+    FLUX_SERVER="$(fluxkit_runtime_get "$runtime_file" FLUX_SERVER)"
+    if [[ -n "${FLUX_SERVER:-}" ]] && fluxkit_server_healthy "$FLUX_SERVER"; then
+      export FLUX_SERVER
+      unset FLUX_DATA FLUX_DIR
+      fluxkit_run_mcp_docker remote
+    fi
+  fi
+
+  export FLUX_DIR="$(fluxkit_flux_dir)"
+  export FLUX_DATA="$data_file"
+  unset FLUX_SERVER
+  fluxkit_run_mcp_docker local
+}
+
+# ---------------------------------------------------------------------------
+# Configuration status
+# ---------------------------------------------------------------------------
+
+fluxkit_cmd_configured() {
+  local quiet=0 root mode scope flux_dir data_file config_file mcp
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -q|--quiet)
+        quiet=1
+        ;;
+      *)
+        fluxkit_die "unknown configured option: $1 (use --quiet or no options)"
+        ;;
+    esac
+    shift
+  done
+
+  root="$(fluxkit_repo_root 2>/dev/null || true)"
+  if [[ -z "$root" ]]; then
+    (( quiet )) || {
+      echo "configured: no"
+      echo "reason: not inside a git repository"
+    }
+    return 1
+  fi
+
+  if fluxkit_local_configured; then
+    FLUXKIT_STATE_MODE=local
+    mode="local"
+    scope="n/a"
+    flux_dir="$(fluxkit_local_flux_dir)"
+    mcp=".flux/bin/mcp"
+  elif fluxkit_external_configured; then
+    FLUXKIT_STATE_MODE=external
+    mode="external"
+    scope="$(fluxkit_external_scope)"
+    flux_dir="$(fluxkit_external_flux_dir)"
+    mcp="fluxkit mcp"
+  else
+    (( quiet )) || {
+      echo "configured: no"
+      echo "repo root: $root"
+      echo "fix: fluxkit init  OR  fluxkit init --external"
+    }
+    return 1
+  fi
+
+  data_file="$flux_dir/data.json"
+  config_file="$flux_dir/config.json"
+  (( quiet )) && return 0
+
+  echo "configured: yes"
+  echo "repo root: $root"
+  echo "mode: $mode"
+  echo "scope: $scope"
+  if [[ "$mode" == "external" && "$scope" == "branch" ]]; then
+    echo "branch: $(fluxkit_branch_name)"
+  fi
+  echo "config: $config_file"
+  echo "data: $data_file"
+  echo "mcp: $mcp"
+}
+
+# ---------------------------------------------------------------------------
 # UI commands
 # ---------------------------------------------------------------------------
 
@@ -632,6 +1343,7 @@ fluxkit_write_runtime_env() {
   root="$(fluxkit_repo_root)"
   canonical="$(fluxkit_canonical_path "$root")"
   runtime_file="$(fluxkit_runtime_env)"
+  mkdir -p "$(dirname "$runtime_file")"
   cat >"$runtime_file" <<EOF
 FLUX_SERVER=http://127.0.0.1:${port}
 FLUX_UI_PORT=${port}
@@ -663,8 +1375,11 @@ fluxkit_ui_running_info() {
   repo_root="$(fluxkit_repo_root)"
 
   if [[ -f "$runtime_file" ]] && fluxkit_runtime_matches_repo "$runtime_file" "$repo_root"; then
-    # shellcheck disable=SC1090
-    source "$runtime_file"
+    FLUX_UI_PID="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PID)"
+    FLUX_UI_PORT="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PORT)"
+    FLUX_SERVER="$(fluxkit_runtime_get "$runtime_file" FLUX_SERVER)"
+    FLUX_UI_BACKEND="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_BACKEND)"
+    FLUX_UI_CONTAINER="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER)"
     pid="${FLUX_UI_PID:-}"
     port="${FLUX_UI_PORT:-}"
     url="${FLUX_SERVER:-}"
@@ -679,17 +1394,27 @@ fluxkit_ui_running_info() {
     fallback=1
   fi
 
-  printf 'running=%s\nurl=%s\npid=%s\nvalid=%s\npreferred=%s\nport=%s\nfallback=%s\nbackend=%s\n' \
+  printf 'running=%q\nurl=%q\npid=%q\nvalid=%q\npreferred=%q\nport=%q\nfallback=%q\nbackend=%q\n' \
     "$running" "$url" "$pid" "$valid" "$preferred" "$port" "$fallback" "$backend"
 }
 
 fluxkit_start_ui_docker() {
   local port="$1" repo_root="$2" flux_dir="$3" data_file="$4"
   local docker_cmd container_name log_file container_id
+  local state_mode external_scope branch_name canonical_root
+  local volume_args=()
 
   docker_cmd="$(fluxkit_find_docker)"
   container_name="$(fluxkit_ui_container_name)"
-  log_file="$flux_dir/ui.log"
+  log_file="$(fluxkit_ui_log_file)"
+  state_mode="$(fluxkit_state_mode)"
+  external_scope=""
+  if [[ "$state_mode" == "external" ]]; then
+    external_scope="$(fluxkit_external_scope)"
+  fi
+  branch_name="$(fluxkit_branch_name)"
+  canonical_root="$(fluxkit_canonical_path "$repo_root")"
+  mkdir -p "$(dirname "$log_file")"
 
   if ! fluxkit_docker_daemon_ready; then
     fluxkit_die "Docker daemon not reachable (check: docker info)"
@@ -698,11 +1423,23 @@ fluxkit_start_ui_docker() {
   "$docker_cmd" rm -f "$container_name" >/dev/null 2>&1 || true
 
   : >"$log_file"
+  volume_args=(-v "${repo_root}:${repo_root}")
+  if ! fluxkit_path_is_inside "$flux_dir" "$repo_root"; then
+    volume_args+=(-v "${flux_dir}:${flux_dir}")
+  fi
+
   container_id="$("$docker_cmd" run -d \
     --name "$container_name" \
     --user "$(id -u):$(id -g)" \
+    --label "fluxkit.managed=true" \
+    --label "fluxkit.repo_root=${canonical_root}" \
+    --label "fluxkit.flux_dir=${flux_dir}" \
+    --label "fluxkit.data_file=${data_file}" \
+    --label "fluxkit.state_mode=${state_mode}" \
+    --label "fluxkit.external_scope=${external_scope}" \
+    --label "fluxkit.branch=${branch_name}" \
     -p "127.0.0.1:${port}:${port}" \
-    -v "${repo_root}:${repo_root}" \
+    "${volume_args[@]}" \
     -e "FLUX_DIR=${flux_dir}" \
     -e "FLUX_DATA=${data_file}" \
     -e "PORT=${port}" \
@@ -728,6 +1465,7 @@ fluxkit_start_ui_docker() {
 
 fluxkit_cmd_ui_up() {
   local preferred port log_file pid flux_cmd info running backend docker_cmd
+  [[ $# -eq 0 ]] || fluxkit_die "ui up does not accept options; run it inside the repo/branch to start"
   fluxkit_require_git
   preferred="$(fluxkit_preferred_port)"
 
@@ -756,11 +1494,12 @@ fluxkit_cmd_ui_up() {
     fluxkit_die "unknown FLUXKIT_UI_BACKEND: $backend (use docker or cli)"
   fi
 
-  log_file="$flux_dir/ui.log"
+  log_file="$(fluxkit_ui_log_file)"
+  mkdir -p "$(dirname "$log_file")"
 
   if [[ "$backend" == "docker" ]]; then
     fluxkit_start_ui_docker "$port" "$repo_root" "$flux_dir" "$data_file"
-    fluxkit_info "Flux UI started at http://127.0.0.1:${port} (docker: $(fluxkit_ui_container_name))"
+    fluxkit_info "Flux UI started at http://127.0.0.1:${port} (docker: $(fluxkit_ui_container_name), state: $(fluxkit_state_desc))"
   else
     fluxkit_warn "API-only mode (no Kanban web UI); set FLUXKIT_UI_BACKEND=docker for the board"
     flux_cmd="$(fluxkit_flux_cli_runnable)" || fluxkit_die "cli backend requires flux + bun on PATH"
@@ -774,7 +1513,7 @@ fluxkit_cmd_ui_up() {
       fluxkit_die "failed to start Flux API server (see $log_file)"
     fi
     fluxkit_write_runtime_env "$port" "$pid" "cli" ""
-    fluxkit_info "Flux API started at http://127.0.0.1:${port} (pid $pid, no web UI)"
+    fluxkit_info "Flux API started at http://127.0.0.1:${port} (pid $pid, state: $(fluxkit_state_desc), no web UI)"
   fi
 
   if [[ "$port" != "$preferred" ]]; then
@@ -783,7 +1522,54 @@ fluxkit_cmd_ui_up() {
 }
 
 fluxkit_cmd_ui_down() {
-  local runtime_file repo_root pid backend container docker_cmd expected
+  local runtime_file repo_root pid backend container docker_cmd expected all=0 target="" target_set=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all|-a)
+        all=1
+        ;;
+      --target|-t)
+        [[ $# -ge 2 ]] || fluxkit_die "--target requires a CONTAINER value from 'fluxkit ui list'"
+        target="$2"
+        target_set=1
+        shift
+        ;;
+      --target=*)
+        target="${1#--target=}"
+        [[ -n "$target" ]] || fluxkit_die "--target requires a CONTAINER value from 'fluxkit ui list'"
+        target_set=1
+        ;;
+      -t=*)
+        target="${1#-t=}"
+        [[ -n "$target" ]] || fluxkit_die "--target requires a CONTAINER value from 'fluxkit ui list'"
+        target_set=1
+        ;;
+      *)
+        fluxkit_die "unknown ui down option: $1 (use --all, -a, --target, -t, or no options)"
+        ;;
+    esac
+    shift
+  done
+
+  if (( all && target_set )); then
+    fluxkit_die "use either --all or --target, not both"
+  fi
+
+  if (( all )); then
+    fluxkit_cmd_ui_down_all
+    return 0
+  fi
+
+  if (( target_set )) && ! fluxkit_is_fluxkit_container_name "$target" && ! fluxkit_is_docker_container_id "$target"; then
+    fluxkit_die "invalid UI target: $target (use a CONTAINER value from 'fluxkit ui list')"
+  fi
+
+  if (( target_set )); then
+    fluxkit_stop_docker_ui_container "$target"
+    return 0
+  fi
+
   fluxkit_require_git
   runtime_file="$(fluxkit_runtime_env)"
   repo_root="$(fluxkit_repo_root)"
@@ -797,8 +1583,9 @@ fluxkit_cmd_ui_down() {
     fluxkit_die "runtime.env belongs to a different repository; refusing to stop"
   fi
 
-  # shellcheck disable=SC1090
-  source "$runtime_file"
+  FLUX_UI_BACKEND="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_BACKEND)"
+  FLUX_UI_CONTAINER="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER)"
+  FLUX_UI_PID="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PID)"
   backend="${FLUX_UI_BACKEND:-cli}"
 
   if [[ "$backend" == "docker" ]]; then
@@ -808,8 +1595,9 @@ fluxkit_cmd_ui_down() {
     [[ "$container" == "$expected" ]] || fluxkit_die "container $container does not match this repo; refusing to stop"
     docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
     if fluxkit_docker_container_running "$container"; then
+      fluxkit_docker_container_managed "$container" || fluxkit_die "container $container is not managed by Fluxkit"
       "$docker_cmd" rm -f "$container" >/dev/null || fluxkit_die "failed to stop container $container"
-      fluxkit_info "stopped Flux UI (docker: $container)"
+      fluxkit_info "stopped Flux UI (docker: $container, state: $(fluxkit_state_desc))"
     else
       fluxkit_info "recorded container $container is not running"
     fi
@@ -833,8 +1621,45 @@ fluxkit_cmd_ui_down() {
   fi
 
   kill "$pid" 2>/dev/null || fluxkit_die "failed to stop PID $pid"
-  fluxkit_info "stopped Flux UI (pid $pid)"
+  fluxkit_info "stopped Flux UI (pid $pid, state: $(fluxkit_state_desc))"
   rm -f "$runtime_file"
+}
+
+fluxkit_cmd_ui_list() {
+  local docker_cmd rows
+  [[ $# -eq 0 ]] || fluxkit_die "ui list does not accept options"
+  docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
+  fluxkit_docker_daemon_ready || fluxkit_die "Docker daemon not reachable (check: docker info)"
+
+  rows="$(fluxkit_docker_fluxkit_container_rows "$docker_cmd")"
+  if [[ -z "$rows" ]]; then
+    fluxkit_info "no running Fluxkit UI containers"
+    return 0
+  fi
+
+  printf 'CONTAINER\tNAME\tPORTS\tMODE\tSCOPE\tBRANCH\tREPO\tDATA\n'
+  printf '%s\n' "$rows"
+}
+
+fluxkit_cmd_ui_down_all() {
+  local docker_cmd targets target stopped=0
+  docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
+  fluxkit_docker_daemon_ready || fluxkit_die "Docker daemon not reachable (check: docker info)"
+
+  targets="$(fluxkit_docker_fluxkit_container_targets "$docker_cmd")"
+  if [[ -z "$targets" ]]; then
+    fluxkit_info "no running Fluxkit UI containers"
+    return 0
+  fi
+
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    "$docker_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
+    fluxkit_info "stopped Flux UI (docker: $target)"
+    stopped=$((stopped + 1))
+  done <<< "$targets"
+
+  fluxkit_info "stopped $stopped Fluxkit UI container(s)"
 }
 
 fluxkit_cmd_ui_status() {
@@ -882,66 +1707,108 @@ fluxkit_doctor_check() {
 }
 
 fluxkit_cmd_doctor() {
-  local root flux_dir issues=0
+  local root flux_dir mode scope issues=0
   root="$(fluxkit_repo_root 2>/dev/null || true)"
   if [[ -z "$root" ]]; then
     fluxkit_doctor_check "inside a git repository" "fail" "run from inside a git repo"
     exit 1
   fi
   flux_dir="$(fluxkit_flux_dir)"
+  mode="$(fluxkit_state_mode)"
+  scope=""
+  if [[ "$mode" == "external" ]]; then
+    scope="$(fluxkit_external_scope)"
+  fi
 
   echo "fluxkit doctor"
+  echo "state mode: $mode"
+  [[ -n "$scope" ]] && echo "external scope: $scope"
   echo ""
 
   fluxkit_doctor_check "inside a git repository" "ok"
 
   if [[ -f "$(fluxkit_data_file)" ]]; then
-    fluxkit_doctor_check ".flux/data.json exists" "ok"
+    fluxkit_doctor_check "Flux data exists ($(fluxkit_data_file))" "ok"
   else
-    fluxkit_doctor_check ".flux/data.json exists" "fail" "fluxkit init"
+    if [[ "$mode" == "external" ]]; then
+      fluxkit_doctor_check "Flux data exists ($(fluxkit_data_file))" "fail" "fluxkit init --external"
+    else
+      fluxkit_doctor_check "Flux data exists ($(fluxkit_data_file))" "fail" "fluxkit init"
+    fi
     issues=$((issues + 1))
   fi
 
   if [[ -f "$flux_dir/config.json" ]]; then
-    fluxkit_doctor_check ".flux/config.json exists" "ok"
+    fluxkit_doctor_check "Flux config exists ($flux_dir/config.json)" "ok"
   else
-    fluxkit_doctor_check ".flux/config.json exists" "fail" "fluxkit init"
+    if [[ "$mode" == "external" ]]; then
+      fluxkit_doctor_check "Flux config exists ($flux_dir/config.json)" "fail" "fluxkit init --external"
+    else
+      fluxkit_doctor_check "Flux config exists ($flux_dir/config.json)" "fail" "fluxkit init"
+    fi
     issues=$((issues + 1))
   fi
 
   if [[ -f "$flux_dir/project.json" ]]; then
-    fluxkit_doctor_check ".flux/project.json exists" "ok"
+    fluxkit_doctor_check "Flux project hint exists ($flux_dir/project.json)" "ok"
   else
-    fluxkit_doctor_check ".flux/project.json exists" "fail" "fluxkit init"
+    if [[ "$mode" == "external" ]]; then
+      fluxkit_doctor_check "Flux project hint exists ($flux_dir/project.json)" "fail" "fluxkit init --external"
+    else
+      fluxkit_doctor_check "Flux project hint exists ($flux_dir/project.json)" "fail" "fluxkit init"
+    fi
     issues=$((issues + 1))
   fi
 
-  if [[ -f "$root/.cursor/mcp.json" ]] && grep -q '.flux/bin/mcp' "$root/.cursor/mcp.json" 2>/dev/null; then
-    fluxkit_doctor_check ".cursor/mcp.json points to .flux/bin/mcp" "ok"
-  else
-    fluxkit_doctor_check ".cursor/mcp.json points to .flux/bin/mcp" "fail" "fluxkit init"
-    issues=$((issues + 1))
-  fi
+  if [[ "$mode" == "external" ]]; then
+    if fluxkit_global_cursor_configured; then
+      fluxkit_doctor_check "$(fluxkit_global_cursor_mcp_file) contains fluxkit mcp" "ok"
+    else
+      fluxkit_doctor_check "$(fluxkit_global_cursor_mcp_file) contains fluxkit mcp" "fail" "fluxkit init --external"
+      issues=$((issues + 1))
+    fi
 
-  if [[ -f "$root/.codex/config.toml" ]] && grep -q '\[mcp_servers\.flux\]' "$root/.codex/config.toml" 2>/dev/null; then
-    fluxkit_doctor_check ".codex/config.toml contains Flux MCP server" "ok"
-  else
-    fluxkit_doctor_check ".codex/config.toml contains Flux MCP server" "fail" "fluxkit init"
-    issues=$((issues + 1))
-  fi
+    if fluxkit_global_codex_configured; then
+      fluxkit_doctor_check "$(fluxkit_global_codex_config_file) contains fluxkit mcp" "ok"
+    else
+      fluxkit_doctor_check "$(fluxkit_global_codex_config_file) contains fluxkit mcp" "fail" "fluxkit init --external"
+      issues=$((issues + 1))
+    fi
 
-  if [[ -f "$root/AGENTS.md" ]]; then
-    fluxkit_doctor_check "AGENTS.md exists" "ok"
+    if fluxkit_global_agents_block_valid "$(fluxkit_home_agents_file)" 2>/dev/null; then
+      fluxkit_doctor_check "$(fluxkit_home_agents_file) contains Fluxkit global guidance" "ok"
+    else
+      fluxkit_doctor_check "$(fluxkit_home_agents_file) contains Fluxkit global guidance" "fail" "fluxkit init --external"
+      issues=$((issues + 1))
+    fi
   else
-    fluxkit_doctor_check "AGENTS.md exists" "fail" "fluxkit init"
-    issues=$((issues + 1))
-  fi
+    if [[ -f "$root/.cursor/mcp.json" ]] && grep -q '.flux/bin/mcp' "$root/.cursor/mcp.json" 2>/dev/null; then
+      fluxkit_doctor_check ".cursor/mcp.json points to .flux/bin/mcp" "ok"
+    else
+      fluxkit_doctor_check ".cursor/mcp.json points to .flux/bin/mcp" "fail" "fluxkit init"
+      issues=$((issues + 1))
+    fi
 
-  if fluxkit_agents_block_valid "$root/AGENTS.md" 2>/dev/null; then
-    fluxkit_doctor_check "AGENTS.md contains valid Fluxkit managed block" "ok"
-  else
-    fluxkit_doctor_check "AGENTS.md contains valid Fluxkit managed block" "fail" "fluxkit init (check marker pairs)"
-    issues=$((issues + 1))
+    if [[ -f "$root/.codex/config.toml" ]] && grep -q '\[mcp_servers\.flux\]' "$root/.codex/config.toml" 2>/dev/null; then
+      fluxkit_doctor_check ".codex/config.toml contains Flux MCP server" "ok"
+    else
+      fluxkit_doctor_check ".codex/config.toml contains Flux MCP server" "fail" "fluxkit init"
+      issues=$((issues + 1))
+    fi
+
+    if [[ -f "$root/AGENTS.md" ]]; then
+      fluxkit_doctor_check "AGENTS.md exists" "ok"
+    else
+      fluxkit_doctor_check "AGENTS.md exists" "fail" "fluxkit init"
+      issues=$((issues + 1))
+    fi
+
+    if fluxkit_agents_block_valid "$root/AGENTS.md" 2>/dev/null; then
+      fluxkit_doctor_check "AGENTS.md contains valid Fluxkit managed block" "ok"
+    else
+      fluxkit_doctor_check "AGENTS.md contains valid Fluxkit managed block" "fail" "fluxkit init (check marker pairs)"
+      issues=$((issues + 1))
+    fi
   fi
 
   if fluxkit_docker_daemon_ready; then
@@ -964,18 +1831,24 @@ fluxkit_cmd_doctor() {
     fluxkit_doctor_check "UI preferred port ${preferred} (not running)" "warn" "fluxkit ui up"
   fi
 
-  if [[ -x "$flux_dir/bin/mcp" ]]; then
+  if [[ "$mode" == "external" ]]; then
+    fluxkit_doctor_check "MCP command is fluxkit mcp" "ok"
+  elif [[ -x "$flux_dir/bin/mcp" ]]; then
     fluxkit_doctor_check "MCP launcher is executable" "ok"
   else
     fluxkit_doctor_check "MCP launcher is executable" "fail" "fluxkit init && chmod +x .flux/bin/mcp"
     issues=$((issues + 1))
   fi
 
-  if fluxkit_gitignore_ignores_runtime "$root"; then
-    fluxkit_doctor_check ".flux/runtime.env is gitignored" "ok"
+  if [[ "$mode" == "external" ]]; then
+    fluxkit_doctor_check "runtime state is outside the repository ($(fluxkit_runtime_env))" "ok"
   else
-    fluxkit_doctor_check ".flux/runtime.env is gitignored" "fail" "fluxkit init"
-    issues=$((issues + 1))
+    if fluxkit_gitignore_ignores_runtime "$root"; then
+      fluxkit_doctor_check ".flux/runtime.env is gitignored" "ok"
+    else
+      fluxkit_doctor_check ".flux/runtime.env is gitignored" "fail" "fluxkit init"
+      issues=$((issues + 1))
+    fi
   fi
 
   echo ""
@@ -991,22 +1864,46 @@ fluxkit_cmd_doctor() {
 # Help
 # ---------------------------------------------------------------------------
 
+fluxkit_help_row() {
+  printf '  %-48s  %s\n' "$1" "$2"
+}
+
+fluxkit_help_arg_row() {
+  printf '  %-14s  %s\n' "$1" "$2"
+}
+
 fluxkit_cmd_help() {
   cat <<EOF
 fluxkit $FLUXKIT_VERSION — repo-local Flux setup for git projects
 
 Usage:
-  fluxkit init              Initialize .flux/ and editor integrations
-  fluxkit ui up             Start repo-local Flux UI/API server
-  fluxkit ui down           Stop the server started by fluxkit ui up
-  fluxkit ui status         Show UI runtime status
-  fluxkit port              Show preferred and running ports
-  fluxkit doctor            Verify setup and report fixes
-  fluxkit help              Show this help
+EOF
+  fluxkit_help_row "fluxkit init" "Initialize repo-local .flux/ and editor integrations"
+  fluxkit_help_row "fluxkit init [-l | --local]" "Force repo-local .flux creation when external state exists"
+  fluxkit_help_row "fluxkit init [-e | --external] [repo|branch]" "Initialize external Flux state (default: repo)"
+  fluxkit_help_row "fluxkit ui up" "Start Flux UI/API for the current repo/branch"
+  fluxkit_help_row "fluxkit ui down" "Stop the current repo/branch UI"
+  fluxkit_help_row "fluxkit ui down [-t | --target] CONTAINER" "Stop one listed Docker UI container"
+  fluxkit_help_row "fluxkit ui down [-a | --all]" "Stop all running Fluxkit Docker UI containers"
+  fluxkit_help_row "fluxkit ui status" "Show UI runtime status"
+  fluxkit_help_row "fluxkit ui list" "List running Fluxkit Docker UI containers"
+  fluxkit_help_row "fluxkit port" "Show preferred and running ports"
+  fluxkit_help_row "fluxkit mcp" "Run MCP server for the current repo/branch"
+  fluxkit_help_row "fluxkit configured" "Report whether Fluxkit is configured for this repo"
+  fluxkit_help_row "fluxkit doctor" "Verify setup and report fixes"
+  fluxkit_help_row "fluxkit help" "Show this help"
+  cat <<EOF
+
+Arguments:
+EOF
+  fluxkit_help_arg_row "CONTAINER" "ID from the CONTAINER column in 'fluxkit ui list'"
+  cat <<EOF
 
 Environment:
   FLUXKIT_PORT_BASE         Base port for hash-based assignment (default: 42000)
   FLUXKIT_PORT_SPAN         Port range span (default: 1000)
+  FLUXKIT_STATE_MODE        Force state mode: local or external
+  FLUXKIT_EXTERNAL_SCOPE    Force external scope: branch or repo
   FLUXKIT_FLUX_CMD          Override flux CLI path (for testing)
   FLUXKIT_DOCKER_CMD        Override docker path (for testing)
   FLUXKIT_UI_BACKEND        UI backend: docker (default, Kanban UI) or cli (API only)
@@ -1033,10 +1930,13 @@ fluxkit_main() {
         up) fluxkit_cmd_ui_up "$@" ;;
         down) fluxkit_cmd_ui_down "$@" ;;
         status) fluxkit_cmd_ui_status "$@" ;;
-        *) fluxkit_die "unknown ui command: ${sub:-}(none); try: up, down, status" ;;
+        list) fluxkit_cmd_ui_list "$@" ;;
+        *) fluxkit_die "unknown ui command: ${sub:-}(none); try: up, down, status, list" ;;
       esac
       ;;
     port) fluxkit_cmd_port "$@" ;;
+    mcp) fluxkit_cmd_mcp "$@" ;;
+    configured) fluxkit_cmd_configured "$@" ;;
     doctor) fluxkit_cmd_doctor "$@" ;;
     help|--help|-h) fluxkit_cmd_help "$@" ;;
     *)
