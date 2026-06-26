@@ -12,7 +12,8 @@
 set -euo pipefail
 
 FLUXKIT_VERSION="0.1.0"
-FLUX_DOCKER_IMAGE="${FLUXKIT_DOCKER_IMAGE:-sirsjg/flux-mcp:latest}"
+FLUX_CONTAINER_IMAGE="${FLUXKIT_CONTAINER_IMAGE:-sirsjg/flux-mcp:latest}"
+FLUXKIT_CONTAINER_VOLUME_SUFFIX="${FLUXKIT_CONTAINER_VOLUME_SUFFIX:-}"
 FLUXKIT_PORT_BASE="${FLUXKIT_PORT_BASE:-42000}"
 FLUXKIT_PORT_SPAN="${FLUXKIT_PORT_SPAN:-1000}"
 
@@ -56,6 +57,10 @@ fluxkit_require_git() {
 fluxkit_repo_root() {
   fluxkit_require_git
   git rev-parse --show-toplevel
+}
+
+fluxkit_maybe_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null
 }
 
 fluxkit_canonical_path() {
@@ -337,57 +342,91 @@ fluxkit_is_fluxkit_container_name() {
   [[ "$1" =~ ^fluxkit-[0-9a-f]{12}$ ]]
 }
 
-fluxkit_is_docker_container_id() {
+fluxkit_is_container_id() {
   [[ "$1" =~ ^[0-9a-fA-F]{12,64}$ ]]
 }
 
-fluxkit_docker_container_running() {
-  local name="$1" docker_cmd
+fluxkit_container_running() {
+  local name="$1" container_cmd="${2:-}"
   [[ -n "$name" ]] || return 1
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || return 1)"
-  [[ "$("$docker_cmd" inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)" == "true" ]]
+  [[ -n "$container_cmd" ]] || container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || return 1)"
+  [[ "$("$container_cmd" inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)" == "true" ]]
 }
 
-fluxkit_docker_container_managed() {
-  local target="$1" docker_cmd
+fluxkit_container_exists() {
+  local target="$1" container_cmd="${2:-}"
   [[ -n "$target" ]] || return 1
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || return 1)"
-  [[ "$("$docker_cmd" inspect -f '{{ index .Config.Labels "fluxkit.managed" }}' "$target" 2>/dev/null || true)" == "true" ]]
+  [[ -n "$container_cmd" ]] || container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || return 1)"
+  "$container_cmd" inspect "$target" >/dev/null 2>&1
 }
 
-fluxkit_docker_fluxkit_container_targets() {
-  local docker_cmd="$1" id name managed
-  "$docker_cmd" ps --filter "label=fluxkit.managed=true" --format '{{.ID}}\t{{.Names}}\t{{.Label "fluxkit.managed"}}' 2>/dev/null |
-    while IFS=$'\t' read -r id name managed; do
-      [[ "$managed" == "true" ]] || continue
+fluxkit_container_label() {
+  local target="$1" label="$2" container_cmd="${3:-}"
+  [[ -n "$target" && -n "$label" ]] || return 1
+  [[ -n "$container_cmd" ]] || container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || return 1)"
+  "$container_cmd" inspect -f "{{ index .Config.Labels \"$label\" }}" "$target" 2>/dev/null || true
+}
+
+fluxkit_container_name() {
+  local target="$1" container_cmd="${2:-}"
+  [[ -n "$target" ]] || return 1
+  [[ -n "$container_cmd" ]] || container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || return 1)"
+  "$container_cmd" inspect -f '{{.Name}}' "$target" 2>/dev/null | sed 's#^/##' || true
+}
+
+fluxkit_container_target_is_fluxkit() {
+  local target="$1" container_cmd="${2:-}" name
+  if fluxkit_is_fluxkit_container_name "$target"; then
+    return 0
+  fi
+  name="$(fluxkit_container_name "$target" "$container_cmd")"
+  fluxkit_is_fluxkit_container_name "$name"
+}
+
+fluxkit_container_fluxkit_targets() {
+  local container_cmd="$1" id name
+  "$container_cmd" ps --format '{{printf "%s\t%s" .ID .Names}}' 2>/dev/null |
+    while IFS=$'\t' read -r id name; do
       fluxkit_is_fluxkit_container_name "$name" || continue
       [[ -n "$id" ]] || continue
       printf '%s\n' "$id"
     done
 }
 
-fluxkit_docker_fluxkit_container_rows() {
-  local docker_cmd="$1"
-  local id name ports managed mode scope branch repo data
-  "$docker_cmd" ps --filter "label=fluxkit.managed=true" --format '{{.ID}}\t{{.Names}}\t{{.Ports}}\t{{.Label "fluxkit.managed"}}\t{{.Label "fluxkit.state_mode"}}\t{{.Label "fluxkit.external_scope"}}\t{{.Label "fluxkit.branch"}}\t{{.Label "fluxkit.repo_root"}}\t{{.Label "fluxkit.data_file"}}' 2>/dev/null |
-    while IFS=$'\t' read -r id name ports managed mode scope branch repo data; do
-      [[ "$managed" == "true" ]] || continue
+fluxkit_container_fluxkit_rows() {
+  local container_cmd="$1"
+  local id name ports mode scope branch repo data
+  "$container_cmd" ps --format '{{printf "%s\t%s\t%s" .ID .Names .Ports}}' 2>/dev/null |
+    while IFS=$'\t' read -r id name ports; do
       fluxkit_is_fluxkit_container_name "$name" || continue
       [[ -n "$id" ]] || continue
+      mode="$(fluxkit_container_label "$id" "fluxkit.state_mode" "$container_cmd")"
+      scope="$(fluxkit_container_label "$id" "fluxkit.external_scope" "$container_cmd")"
+      branch="$(fluxkit_container_label "$id" "fluxkit.branch" "$container_cmd")"
+      repo="$(fluxkit_container_label "$id" "fluxkit.repo_root" "$container_cmd")"
+      data="$(fluxkit_container_label "$id" "fluxkit.data_file" "$container_cmd")"
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$id" "$name" "${ports:-n/a}" "${mode:-unknown}" "${scope:-n/a}" "${branch:-n/a}" "${repo:-n/a}" "${data:-n/a}"
     done
 }
 
-fluxkit_stop_docker_ui_container() {
-  local target="$1" docker_cmd
-  fluxkit_is_fluxkit_container_name "$target" || fluxkit_is_docker_container_id "$target" || \
+fluxkit_remove_existing_container() {
+  local target="$1" container_cmd="$2"
+  if ! fluxkit_container_exists "$target" "$container_cmd"; then
+    return 0
+  fi
+  "$container_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
+}
+
+fluxkit_stop_ui_container() {
+  local target="$1" container_cmd
+  fluxkit_is_fluxkit_container_name "$target" || fluxkit_is_container_id "$target" || \
     fluxkit_die "invalid Fluxkit container: $target (use a CONTAINER value from 'fluxkit ui list')"
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
-  fluxkit_docker_daemon_ready || fluxkit_die "Docker daemon not reachable (check: docker info)"
-  fluxkit_docker_container_managed "$target" || fluxkit_die "container $target is not managed by Fluxkit"
-  "$docker_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
-  fluxkit_info "stopped Flux UI (docker: $target)"
+  container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || fluxkit_die "container engine not available (install Docker or Podman, or set FLUXKIT_CONTAINER_CMD)")"
+  fluxkit_container_engine_ready "$container_cmd" || fluxkit_die "container engine not reachable (check: $container_cmd info)"
+  fluxkit_container_target_is_fluxkit "$target" "$container_cmd" || fluxkit_die "container $target is not a Fluxkit UI container"
+  "$container_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
+  fluxkit_info "stopped Flux UI (container: $target)"
 }
 
 fluxkit_flux_cli_runnable() {
@@ -402,7 +441,7 @@ fluxkit_flux_cli_runnable() {
 }
 
 fluxkit_ui_backend_available() {
-  fluxkit_docker_daemon_ready
+  fluxkit_container_engine_ready
 }
 
 fluxkit_runtime_matches_repo() {
@@ -438,10 +477,11 @@ fluxkit_find_ui_port() {
     FLUX_UI_PORT="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PORT)"
     FLUX_UI_BACKEND="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_BACKEND)"
     FLUX_UI_CONTAINER="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER)"
+    FLUX_UI_CONTAINER_CMD="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER_CMD)"
     FLUX_UI_PID="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PID)"
     if [[ "${FLUX_UI_PORT:-}" == "$preferred" ]]; then
-      if [[ "${FLUX_UI_BACKEND:-cli}" == "docker" ]]; then
-        if fluxkit_docker_container_running "${FLUX_UI_CONTAINER:-}"; then
+      if [[ "${FLUX_UI_BACKEND:-cli}" == "container" ]]; then
+        if fluxkit_container_running "${FLUX_UI_CONTAINER:-}" "${FLUX_UI_CONTAINER_CMD:-}"; then
           echo "$preferred"
           return 0
         fi
@@ -485,22 +525,37 @@ fluxkit_find_flux_cli() {
   return 1
 }
 
-fluxkit_find_docker() {
-  if [[ -n "${FLUXKIT_DOCKER_CMD:-}" ]]; then
-    echo "$FLUXKIT_DOCKER_CMD"
+fluxkit_find_container_cmd() {
+  local candidate first_installed=""
+  if [[ -n "${FLUXKIT_CONTAINER_CMD:-}" ]]; then
+    echo "$FLUXKIT_CONTAINER_CMD"
     return 0
   fi
-  if command -v docker >/dev/null 2>&1; then
-    command -v docker
+  if [[ -n "${FLUXKIT_RUNTIME_CONTAINER_CMD:-}" ]]; then
+    echo "$FLUXKIT_RUNTIME_CONTAINER_CMD"
+    return 0
+  fi
+  for candidate in docker podman; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      candidate="$(command -v "$candidate")"
+      [[ -n "$first_installed" ]] || first_installed="$candidate"
+      if "$candidate" info >/dev/null 2>&1; then
+        echo "$candidate"
+        return 0
+      fi
+    fi
+  done
+  if [[ -n "$first_installed" ]]; then
+    echo "$first_installed"
     return 0
   fi
   return 1
 }
 
-fluxkit_docker_daemon_ready() {
-  local docker_cmd
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || return 1)"
-  "$docker_cmd" info >/dev/null 2>&1
+fluxkit_container_engine_ready() {
+  local container_cmd="${1:-}"
+  [[ -n "$container_cmd" ]] || container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || return 1)"
+  "$container_cmd" info >/dev/null 2>&1
 }
 
 fluxkit_has_flux_backend() {
@@ -731,7 +786,8 @@ FLUX_DIR="\$(cd "\$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="\$(cd "\$FLUX_DIR/.." && pwd)"
 RUNTIME_ENV="\$FLUX_DIR/runtime.env"
 DATA_FILE="\$FLUX_DIR/data.json"
-FLUX_DOCKER_IMAGE="$FLUX_DOCKER_IMAGE"
+FLUX_CONTAINER_IMAGE="\${FLUXKIT_CONTAINER_IMAGE:-$FLUX_CONTAINER_IMAGE}"
+FLUXKIT_CONTAINER_VOLUME_SUFFIX="\${FLUXKIT_CONTAINER_VOLUME_SUFFIX:-}"
 
 runtime_get() {
   local file="\$1" key="\$2" line
@@ -740,42 +796,72 @@ runtime_get() {
   printf '%s' "\${line#*=}"
 }
 
-run_mcp_docker() {
-  local docker_cmd mode="\$1"
+RUNTIME_CONTAINER_CMD=""
+
+find_container_cmd() {
+  local candidate first_installed=""
+  if [[ -n "\${FLUXKIT_CONTAINER_CMD:-}" ]]; then
+    echo "\$FLUXKIT_CONTAINER_CMD"
+    return 0
+  fi
+  if [[ -n "\${RUNTIME_CONTAINER_CMD:-}" ]]; then
+    echo "\$RUNTIME_CONTAINER_CMD"
+    return 0
+  fi
+  for candidate in docker podman; do
+    if command -v "\$candidate" >/dev/null 2>&1; then
+      candidate="\$(command -v "\$candidate")"
+      [[ -n "\$first_installed" ]] || first_installed="\$candidate"
+      if "\$candidate" info >/dev/null 2>&1; then
+        echo "\$candidate"
+        return 0
+      fi
+    fi
+  done
+  if [[ -n "\$first_installed" ]]; then
+    echo "\$first_installed"
+    return 0
+  fi
+  return 1
+}
+
+run_mcp_container() {
+  local container_cmd mode="\$1"
   shift
-  docker_cmd="\$(command -v docker 2>/dev/null || true)"
-  [[ -n "\$docker_cmd" ]] || {
-    echo "flux-mcp: docker required for MCP (image: \$FLUX_DOCKER_IMAGE)" >&2
+  container_cmd="\$(find_container_cmd 2>/dev/null || true)"
+  [[ -n "\$container_cmd" ]] || {
+    echo "flux-mcp: Docker or Podman required for MCP (image: \$FLUX_CONTAINER_IMAGE)" >&2
     echo "flux-mcp: run: fluxkit ui up  (starts UI + enables remote MCP mode)" >&2
     exit 1
   }
-  if ! "\$docker_cmd" info >/dev/null 2>&1; then
-    echo "flux-mcp: docker daemon not reachable (check: docker info)" >&2
+  if ! "\$container_cmd" info >/dev/null 2>&1; then
+    echo "flux-mcp: container engine not reachable (check: \$container_cmd info)" >&2
     exit 1
   fi
   if [[ "\$mode" == "remote" ]]; then
-    exec "\$docker_cmd" run -i --rm \
+    exec "\$container_cmd" run -i --rm \
       --network host \
       -e "FLUX_SERVER=\$FLUX_SERVER" \
-      "\$FLUX_DOCKER_IMAGE" \
+      "\$FLUX_CONTAINER_IMAGE" \
       bun /app/packages/mcp/dist/index.js
   fi
-  exec "\$docker_cmd" run -i --rm \
+  exec "\$container_cmd" run -i --rm \
     --user "\$(id -u):\$(id -g)" \
-    -v "\$REPO_ROOT:\$REPO_ROOT" \
+    -v "\$REPO_ROOT:\$REPO_ROOT\$FLUXKIT_CONTAINER_VOLUME_SUFFIX" \
     -e "FLUX_DIR=\$FLUX_DIR" \
     -e "FLUX_DATA=\$DATA_FILE" \
-    "\$FLUX_DOCKER_IMAGE" \
+    "\$FLUX_CONTAINER_IMAGE" \
     bun /app/packages/mcp/dist/index.js
 }
 
 if [[ -f "\$RUNTIME_ENV" ]]; then
+  RUNTIME_CONTAINER_CMD="\$(runtime_get "\$RUNTIME_ENV" FLUX_UI_CONTAINER_CMD)"
   FLUX_SERVER="\$(runtime_get "\$RUNTIME_ENV" FLUX_SERVER)"
   if [[ -n "\${FLUX_SERVER:-}" ]]; then
     if command -v curl >/dev/null 2>&1 && curl -sf --max-time 2 "\${FLUX_SERVER%/}/api/projects" >/dev/null 2>&1; then
       export FLUX_SERVER
       unset FLUX_DATA FLUX_DIR
-      run_mcp_docker remote
+      run_mcp_container remote
     fi
   fi
 fi
@@ -784,7 +870,7 @@ cd "\$REPO_ROOT"
 export FLUX_DIR="\$FLUX_DIR"
 export FLUX_DATA="\$DATA_FILE"
 unset FLUX_SERVER
-run_mcp_docker local
+run_mcp_container local
 LAUNCHER
   chmod +x "$mcp_script"
 }
@@ -1204,27 +1290,27 @@ EOF
 # MCP command
 # ---------------------------------------------------------------------------
 
-fluxkit_run_mcp_docker() {
-  local mode="$1" docker_cmd repo_root flux_dir data_file
+fluxkit_run_mcp_container() {
+  local mode="$1" container_cmd repo_root flux_dir data_file
   local volume_args=()
   shift || true
 
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || true)"
-  [[ -n "$docker_cmd" ]] || {
-    echo "flux-mcp: docker required for MCP (image: $FLUX_DOCKER_IMAGE)" >&2
+  container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || true)"
+  [[ -n "$container_cmd" ]] || {
+    echo "flux-mcp: Docker or Podman required for MCP (image: $FLUX_CONTAINER_IMAGE)" >&2
     echo "flux-mcp: run: fluxkit ui up  (starts UI + enables remote MCP mode)" >&2
     exit 1
   }
-  if ! "$docker_cmd" info >/dev/null 2>&1; then
-    echo "flux-mcp: docker daemon not reachable (check: docker info)" >&2
+  if ! "$container_cmd" info >/dev/null 2>&1; then
+    echo "flux-mcp: container engine not reachable (check: $container_cmd info)" >&2
     exit 1
   fi
 
   if [[ "$mode" == "remote" ]]; then
-    exec "$docker_cmd" run -i --rm \
+    exec "$container_cmd" run -i --rm \
       --network host \
       -e "FLUX_SERVER=$FLUX_SERVER" \
-      "$FLUX_DOCKER_IMAGE" \
+      "$FLUX_CONTAINER_IMAGE" \
       bun /app/packages/mcp/dist/index.js
   fi
 
@@ -1232,40 +1318,256 @@ fluxkit_run_mcp_docker() {
   flux_dir="$(fluxkit_flux_dir)"
   data_file="$(fluxkit_data_file)"
 
-  volume_args=(-v "${repo_root}:${repo_root}")
+  volume_args=(-v "${repo_root}:${repo_root}${FLUXKIT_CONTAINER_VOLUME_SUFFIX}")
   if ! fluxkit_path_is_inside "$flux_dir" "$repo_root"; then
-    volume_args+=(-v "${flux_dir}:${flux_dir}")
+    volume_args+=(-v "${flux_dir}:${flux_dir}${FLUXKIT_CONTAINER_VOLUME_SUFFIX}")
   fi
 
-  exec "$docker_cmd" run -i --rm \
+  exec "$container_cmd" run -i --rm \
     --user "$(id -u):$(id -g)" \
     "${volume_args[@]}" \
     -e "FLUX_DIR=${flux_dir}" \
     -e "FLUX_DATA=${data_file}" \
-    "$FLUX_DOCKER_IMAGE" \
+    "$FLUX_CONTAINER_IMAGE" \
     bun /app/packages/mcp/dist/index.js
 }
 
-fluxkit_cmd_mcp() {
-  local runtime_file data_file
-  fluxkit_require_git
-  data_file="$(fluxkit_data_file)"
-  [[ -f "$data_file" ]] || fluxkit_die "Fluxkit is not initialized for this repo/branch; run: fluxkit init --external"
+fluxkit_run_disabled_mcp_shell() {
+  local reason="$1" line method id
+  local reason_json instructions_json version_json
+  reason_json="$(fluxkit_json_quote "$reason")"
+  instructions_json="$(fluxkit_json_quote "Fluxkit MCP is disabled here: $reason. Run fluxkit init -e repo or fluxkit init -e branch in repositories where Flux should be enabled.")"
+  version_json="$(fluxkit_json_quote "$FLUXKIT_VERSION")"
 
+  while IFS= read -r line; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    method="$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    id="$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p')"
+    [[ -n "$id" ]] || continue
+
+    case "$method" in
+      initialize)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"prompts":{"listChanged":false}},"serverInfo":{"name":"fluxkit-disabled","version":%s},"instructions":%s}}\n' "$id" "$version_json" "$instructions_json"
+        ;;
+      tools/list)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+        ;;
+      resources/list)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[]}}\n' "$id"
+        ;;
+      resources/templates/list)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resourceTemplates":[]}}\n' "$id"
+        ;;
+      prompts/list)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":[]}}\n' "$id"
+        ;;
+      ping|logging/setLevel)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+        ;;
+      completion/complete)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"completion":{"values":[],"total":0,"hasMore":false}}}\n' "$id"
+        ;;
+      *)
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Fluxkit MCP is disabled for this repository","data":{"reason":%s}}}\n' "$id" "$reason_json"
+        ;;
+    esac
+  done
+}
+
+fluxkit_run_disabled_mcp() {
+  local reason="$1"
+
+  if [[ -t 0 && -t 1 ]]; then
+    fluxkit_die "$reason; run 'fluxkit init -e repo' or 'fluxkit init -e branch' to enable Fluxkit here"
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json
+import sys
+
+reason = sys.argv[1]
+version = sys.argv[2]
+framed_output = False
+
+
+def read_messages(stream):
+    while True:
+        line = stream.readline()
+        if not line:
+            break
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith(b"content-length:"):
+            try:
+                length = int(stripped.split(b":", 1)[1].strip())
+            except Exception:
+                yield b"", True
+                continue
+            while True:
+                header = stream.readline()
+                if not header or header in (b"\n", b"\r\n"):
+                    break
+            payload = stream.read(length)
+            if not payload:
+                break
+            yield payload, True
+        else:
+            yield stripped, False
+
+
+def send(message, framed=False):
+    global framed_output
+    framed_output = framed_output or framed
+    payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    if framed_output:
+        sys.stdout.buffer.write(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
+    else:
+        sys.stdout.buffer.write(payload + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def disabled_instructions():
+    return (
+        "Fluxkit MCP is disabled here: "
+        + reason
+        + ". Run fluxkit init -e repo or fluxkit init -e branch in repositories where Flux should be enabled."
+    )
+
+
+def response_for(message):
+    if not isinstance(message, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
+
+    if "id" not in message:
+        return None
+
+    request_id = message.get("id")
+    method = message.get("method")
+    params = message.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": params.get("protocolVersion") or "2024-11-05",
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False},
+                },
+                "serverInfo": {"name": "fluxkit-disabled", "version": version},
+                "instructions": disabled_instructions(),
+            },
+        }
+
+    if method == "tools/list":
+        result = {"tools": []}
+    elif method == "resources/list":
+        result = {"resources": []}
+    elif method == "resources/templates/list":
+        result = {"resourceTemplates": []}
+    elif method == "prompts/list":
+        result = {"prompts": []}
+    elif method in ("ping", "logging/setLevel"):
+        result = {}
+    elif method == "completion/complete":
+        result = {"completion": {"values": [], "total": 0, "hasMore": False}}
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": "Fluxkit MCP is disabled for this repository",
+                "data": {"reason": reason},
+            },
+        }
+
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def handle(raw, framed):
+    try:
+        message = json.loads(raw.decode("utf-8"))
+    except Exception:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error"},
+            },
+            framed,
+        )
+        return
+
+    if isinstance(message, list):
+        responses = [response_for(item) for item in message]
+        responses = [item for item in responses if item is not None]
+        if responses:
+            send(responses, framed)
+        return
+
+    response = response_for(message)
+    if response is not None:
+        send(response, framed)
+
+
+for raw_message, is_framed in read_messages(sys.stdin.buffer):
+    handle(raw_message, is_framed)
+' "$reason" "$FLUXKIT_VERSION"
+    return 0
+  fi
+
+  fluxkit_run_disabled_mcp_shell "$reason"
+}
+
+fluxkit_cmd_mcp() {
+  local runtime_file data_file root
+  if ! root="$(fluxkit_maybe_repo_root)"; then
+    fluxkit_run_disabled_mcp "not inside a git repository"
+    return 0
+  fi
+
+  if fluxkit_local_configured; then
+    FLUXKIT_STATE_MODE=local
+  elif fluxkit_external_configured; then
+    FLUXKIT_STATE_MODE=external
+  else
+    fluxkit_run_disabled_mcp "Fluxkit is not initialized for this repo/branch"
+    return 0
+  fi
+
+  data_file="$(fluxkit_data_file)"
+  if [[ ! -f "$data_file" ]]; then
+    fluxkit_run_disabled_mcp "Fluxkit data file is missing: $data_file"
+    return 0
+  fi
+
+  unset FLUXKIT_RUNTIME_CONTAINER_CMD
   runtime_file="$(fluxkit_runtime_env)"
   if [[ -f "$runtime_file" ]] && fluxkit_runtime_matches_repo "$runtime_file" "$(fluxkit_repo_root)"; then
+    FLUXKIT_RUNTIME_CONTAINER_CMD="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER_CMD)"
     FLUX_SERVER="$(fluxkit_runtime_get "$runtime_file" FLUX_SERVER)"
     if [[ -n "${FLUX_SERVER:-}" ]] && fluxkit_server_healthy "$FLUX_SERVER"; then
       export FLUX_SERVER
       unset FLUX_DATA FLUX_DIR
-      fluxkit_run_mcp_docker remote
+      fluxkit_run_mcp_container remote
     fi
   fi
 
   export FLUX_DIR="$(fluxkit_flux_dir)"
   export FLUX_DATA="$data_file"
   unset FLUX_SERVER
-  fluxkit_run_mcp_docker local
+  fluxkit_run_mcp_container local
 }
 
 # ---------------------------------------------------------------------------
@@ -1287,8 +1589,7 @@ fluxkit_cmd_configured() {
     shift
   done
 
-  root="$(fluxkit_repo_root 2>/dev/null || true)"
-  if [[ -z "$root" ]]; then
+  if ! root="$(fluxkit_maybe_repo_root)"; then
     (( quiet )) || {
       echo "configured: no"
       echo "reason: not inside a git repository"
@@ -1338,7 +1639,7 @@ fluxkit_cmd_configured() {
 # ---------------------------------------------------------------------------
 
 fluxkit_write_runtime_env() {
-  local port="$1" pid="$2" backend="${3:-cli}" container="${4:-}"
+  local port="$1" pid="$2" backend="${3:-cli}" container="${4:-}" container_cmd="${5:-}"
   local root canonical runtime_file
   root="$(fluxkit_repo_root)"
   canonical="$(fluxkit_canonical_path "$root")"
@@ -1350,6 +1651,7 @@ FLUX_UI_PORT=${port}
 FLUX_UI_PID=${pid}
 FLUX_UI_BACKEND=${backend}
 FLUX_UI_CONTAINER=${container}
+FLUX_UI_CONTAINER_CMD=${container_cmd}
 FLUX_REPO_ROOT=${canonical}
 EOF
 }
@@ -1357,10 +1659,10 @@ EOF
 fluxkit_ui_process_valid() {
   local repo_root="$1"
   local backend="${FLUX_UI_BACKEND:-cli}"
-  if [[ "$backend" == "docker" ]]; then
+  if [[ "$backend" == "container" ]]; then
     local expected
     expected="$(fluxkit_ui_container_name)"
-    [[ "${FLUX_UI_CONTAINER:-}" == "$expected" ]] && fluxkit_docker_container_running "$expected"
+    [[ "${FLUX_UI_CONTAINER:-}" == "$expected" ]] && fluxkit_container_running "$expected" "${FLUX_UI_CONTAINER_CMD:-}"
     return
   fi
   fluxkit_pid_alive "${FLUX_UI_PID:-}" && fluxkit_is_flux_serve_process "${FLUX_UI_PID}" "$repo_root"
@@ -1398,13 +1700,13 @@ fluxkit_ui_running_info() {
     "$running" "$url" "$pid" "$valid" "$preferred" "$port" "$fallback" "$backend"
 }
 
-fluxkit_start_ui_docker() {
+fluxkit_start_ui_container() {
   local port="$1" repo_root="$2" flux_dir="$3" data_file="$4"
-  local docker_cmd container_name log_file container_id
+  local container_cmd container_name log_file container_id
   local state_mode external_scope branch_name canonical_root
   local volume_args=()
 
-  docker_cmd="$(fluxkit_find_docker)"
+  container_cmd="$(fluxkit_find_container_cmd)"
   container_name="$(fluxkit_ui_container_name)"
   log_file="$(fluxkit_ui_log_file)"
   state_mode="$(fluxkit_state_mode)"
@@ -1416,22 +1718,21 @@ fluxkit_start_ui_docker() {
   canonical_root="$(fluxkit_canonical_path "$repo_root")"
   mkdir -p "$(dirname "$log_file")"
 
-  if ! fluxkit_docker_daemon_ready; then
-    fluxkit_die "Docker daemon not reachable (check: docker info)"
+  if ! fluxkit_container_engine_ready "$container_cmd"; then
+    fluxkit_die "container engine not reachable (check: $container_cmd info)"
   fi
 
-  "$docker_cmd" rm -f "$container_name" >/dev/null 2>&1 || true
+  fluxkit_remove_existing_container "$container_name" "$container_cmd"
 
   : >"$log_file"
-  volume_args=(-v "${repo_root}:${repo_root}")
+  volume_args=(-v "${repo_root}:${repo_root}${FLUXKIT_CONTAINER_VOLUME_SUFFIX}")
   if ! fluxkit_path_is_inside "$flux_dir" "$repo_root"; then
-    volume_args+=(-v "${flux_dir}:${flux_dir}")
+    volume_args+=(-v "${flux_dir}:${flux_dir}${FLUXKIT_CONTAINER_VOLUME_SUFFIX}")
   fi
 
-  container_id="$("$docker_cmd" run -d \
+  container_id="$("$container_cmd" run -d \
     --name "$container_name" \
     --user "$(id -u):$(id -g)" \
-    --label "fluxkit.managed=true" \
     --label "fluxkit.repo_root=${canonical_root}" \
     --label "fluxkit.flux_dir=${flux_dir}" \
     --label "fluxkit.data_file=${data_file}" \
@@ -1443,28 +1744,28 @@ fluxkit_start_ui_docker() {
     -e "FLUX_DIR=${flux_dir}" \
     -e "FLUX_DATA=${data_file}" \
     -e "PORT=${port}" \
-    "$FLUX_DOCKER_IMAGE" \
+    "$FLUX_CONTAINER_IMAGE" \
     bun /app/packages/server/dist/index.js 2>>"$log_file")" || {
-    fluxkit_die "failed to start Flux UI via Docker (see $log_file)"
+    fluxkit_die "failed to start Flux UI via container engine (see $log_file)"
   }
 
   local i
   for i in $(seq 1 30); do
     if fluxkit_server_healthy "http://127.0.0.1:${port}"; then
-      fluxkit_write_runtime_env "$port" "" "docker" "$container_name"
+      fluxkit_write_runtime_env "$port" "" "container" "$container_name" "$container_cmd"
       return 0
     fi
     sleep 1
   done
 
-  "$docker_cmd" logs "$container_id" >>"$log_file" 2>&1 || \
-    "$docker_cmd" logs "$container_name" >>"$log_file" 2>&1 || true
-  "$docker_cmd" rm -f "$container_name" >/dev/null 2>&1 || true
+  "$container_cmd" logs "$container_id" >>"$log_file" 2>&1 || \
+    "$container_cmd" logs "$container_name" >>"$log_file" 2>&1 || true
+  "$container_cmd" rm -f "$container_name" >/dev/null 2>&1 || true
   fluxkit_die "Flux UI container failed to become healthy (see $log_file)"
 }
 
 fluxkit_cmd_ui_up() {
-  local preferred port log_file pid flux_cmd info running backend docker_cmd
+  local preferred port log_file pid flux_cmd info running backend container_cmd
   [[ $# -eq 0 ]] || fluxkit_die "ui up does not accept options; run it inside the repo/branch to start"
   fluxkit_require_git
   preferred="$(fluxkit_preferred_port)"
@@ -1487,21 +1788,21 @@ fluxkit_cmd_ui_up() {
   repo_root="$(fluxkit_repo_root)"
   [[ -f "$data_file" ]] || fluxkit_die "missing $data_file — run: fluxkit init"
 
-  backend="${FLUXKIT_UI_BACKEND:-docker}"
-  if [[ "$backend" == "docker" ]]; then
-    fluxkit_docker_daemon_ready || fluxkit_die "Docker required for Kanban UI (image: $FLUX_DOCKER_IMAGE) — check: docker info"
+  backend="${FLUXKIT_UI_BACKEND:-container}"
+  if [[ "$backend" == "container" ]]; then
+    fluxkit_container_engine_ready || fluxkit_die "Docker or Podman required for Kanban UI (image: $FLUX_CONTAINER_IMAGE)"
   elif [[ "$backend" != "cli" ]]; then
-    fluxkit_die "unknown FLUXKIT_UI_BACKEND: $backend (use docker or cli)"
+    fluxkit_die "unknown FLUXKIT_UI_BACKEND: $backend (use container or cli)"
   fi
 
   log_file="$(fluxkit_ui_log_file)"
   mkdir -p "$(dirname "$log_file")"
 
-  if [[ "$backend" == "docker" ]]; then
-    fluxkit_start_ui_docker "$port" "$repo_root" "$flux_dir" "$data_file"
-    fluxkit_info "Flux UI started at http://127.0.0.1:${port} (docker: $(fluxkit_ui_container_name), state: $(fluxkit_state_desc))"
+  if [[ "$backend" == "container" ]]; then
+    fluxkit_start_ui_container "$port" "$repo_root" "$flux_dir" "$data_file"
+    fluxkit_info "Flux UI started at http://127.0.0.1:${port} (container: $(fluxkit_ui_container_name), state: $(fluxkit_state_desc))"
   else
-    fluxkit_warn "API-only mode (no Kanban web UI); set FLUXKIT_UI_BACKEND=docker for the board"
+    fluxkit_warn "API-only mode (no Kanban web UI); set FLUXKIT_UI_BACKEND=container for the board"
     flux_cmd="$(fluxkit_flux_cli_runnable)" || fluxkit_die "cli backend requires flux + bun on PATH"
     (
       cd "$repo_root"
@@ -1522,7 +1823,7 @@ fluxkit_cmd_ui_up() {
 }
 
 fluxkit_cmd_ui_down() {
-  local runtime_file repo_root pid backend container docker_cmd expected all=0 target="" target_set=0
+  local runtime_file repo_root pid backend container container_cmd expected all=0 target="" target_set=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1561,12 +1862,12 @@ fluxkit_cmd_ui_down() {
     return 0
   fi
 
-  if (( target_set )) && ! fluxkit_is_fluxkit_container_name "$target" && ! fluxkit_is_docker_container_id "$target"; then
+  if (( target_set )) && ! fluxkit_is_fluxkit_container_name "$target" && ! fluxkit_is_container_id "$target"; then
     fluxkit_die "invalid UI target: $target (use a CONTAINER value from 'fluxkit ui list')"
   fi
 
   if (( target_set )); then
-    fluxkit_stop_docker_ui_container "$target"
+    fluxkit_stop_ui_container "$target"
     return 0
   fi
 
@@ -1585,19 +1886,20 @@ fluxkit_cmd_ui_down() {
 
   FLUX_UI_BACKEND="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_BACKEND)"
   FLUX_UI_CONTAINER="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER)"
+  FLUX_UI_CONTAINER_CMD="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_CONTAINER_CMD)"
   FLUX_UI_PID="$(fluxkit_runtime_get "$runtime_file" FLUX_UI_PID)"
   backend="${FLUX_UI_BACKEND:-cli}"
 
-  if [[ "$backend" == "docker" ]]; then
+  if [[ "$backend" == "container" ]]; then
     container="${FLUX_UI_CONTAINER:-}"
     expected="$(fluxkit_ui_container_name)"
     [[ -n "$container" ]] || fluxkit_die "runtime.env missing FLUX_UI_CONTAINER"
     [[ "$container" == "$expected" ]] || fluxkit_die "container $container does not match this repo; refusing to stop"
-    docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
-    if fluxkit_docker_container_running "$container"; then
-      fluxkit_docker_container_managed "$container" || fluxkit_die "container $container is not managed by Fluxkit"
-      "$docker_cmd" rm -f "$container" >/dev/null || fluxkit_die "failed to stop container $container"
-      fluxkit_info "stopped Flux UI (docker: $container, state: $(fluxkit_state_desc))"
+    container_cmd="${FLUX_UI_CONTAINER_CMD:-}"
+    [[ -n "$container_cmd" ]] || container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || fluxkit_die "container engine not available (install Docker or Podman, or set FLUXKIT_CONTAINER_CMD)")"
+    if fluxkit_container_running "$container" "$container_cmd"; then
+      "$container_cmd" rm -f "$container" >/dev/null || fluxkit_die "failed to stop container $container"
+      fluxkit_info "stopped Flux UI (container: $container, state: $(fluxkit_state_desc))"
     else
       fluxkit_info "recorded container $container is not running"
     fi
@@ -1626,12 +1928,12 @@ fluxkit_cmd_ui_down() {
 }
 
 fluxkit_cmd_ui_list() {
-  local docker_cmd rows
+  local container_cmd rows
   [[ $# -eq 0 ]] || fluxkit_die "ui list does not accept options"
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
-  fluxkit_docker_daemon_ready || fluxkit_die "Docker daemon not reachable (check: docker info)"
+  container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || fluxkit_die "container engine not available (install Docker or Podman, or set FLUXKIT_CONTAINER_CMD)")"
+  fluxkit_container_engine_ready "$container_cmd" || fluxkit_die "container engine not reachable (check: $container_cmd info)"
 
-  rows="$(fluxkit_docker_fluxkit_container_rows "$docker_cmd")"
+  rows="$(fluxkit_container_fluxkit_rows "$container_cmd")"
   if [[ -z "$rows" ]]; then
     fluxkit_info "no running Fluxkit UI containers"
     return 0
@@ -1642,11 +1944,11 @@ fluxkit_cmd_ui_list() {
 }
 
 fluxkit_cmd_ui_down_all() {
-  local docker_cmd targets target stopped=0
-  docker_cmd="$(fluxkit_find_docker 2>/dev/null || fluxkit_die "docker not available")"
-  fluxkit_docker_daemon_ready || fluxkit_die "Docker daemon not reachable (check: docker info)"
+  local container_cmd targets target stopped=0
+  container_cmd="$(fluxkit_find_container_cmd 2>/dev/null || fluxkit_die "container engine not available (install Docker or Podman, or set FLUXKIT_CONTAINER_CMD)")"
+  fluxkit_container_engine_ready "$container_cmd" || fluxkit_die "container engine not reachable (check: $container_cmd info)"
 
-  targets="$(fluxkit_docker_fluxkit_container_targets "$docker_cmd")"
+  targets="$(fluxkit_container_fluxkit_targets "$container_cmd")"
   if [[ -z "$targets" ]]; then
     fluxkit_info "no running Fluxkit UI containers"
     return 0
@@ -1654,8 +1956,8 @@ fluxkit_cmd_ui_down_all() {
 
   while IFS= read -r target; do
     [[ -n "$target" ]] || continue
-    "$docker_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
-    fluxkit_info "stopped Flux UI (docker: $target)"
+    "$container_cmd" rm -f "$target" >/dev/null || fluxkit_die "failed to stop container $target"
+    fluxkit_info "stopped Flux UI (container: $target)"
     stopped=$((stopped + 1))
   done <<< "$targets"
 
@@ -1708,8 +2010,7 @@ fluxkit_doctor_check() {
 
 fluxkit_cmd_doctor() {
   local root flux_dir mode scope issues=0
-  root="$(fluxkit_repo_root 2>/dev/null || true)"
-  if [[ -z "$root" ]]; then
+  if ! root="$(fluxkit_maybe_repo_root)"; then
     fluxkit_doctor_check "inside a git repository" "fail" "run from inside a git repo"
     exit 1
   fi
@@ -1811,10 +2112,10 @@ fluxkit_cmd_doctor() {
     fi
   fi
 
-  if fluxkit_docker_daemon_ready; then
-    fluxkit_doctor_check "Docker ready for Kanban UI ($FLUX_DOCKER_IMAGE)" "ok"
+  if fluxkit_container_engine_ready; then
+    fluxkit_doctor_check "Container engine ready for Kanban UI ($FLUX_CONTAINER_IMAGE)" "ok"
   else
-    fluxkit_doctor_check "Docker ready for Kanban UI" "fail" "check: docker info (required for fluxkit ui up)"
+    fluxkit_doctor_check "Container engine ready for Kanban UI" "fail" "check: docker info or podman info (required for fluxkit ui up)"
     issues=$((issues + 1))
   fi
 
@@ -1872,6 +2173,10 @@ fluxkit_help_arg_row() {
   printf '  %-14s  %s\n' "$1" "$2"
 }
 
+fluxkit_help_env_row() {
+  printf '  %-35s  %s\n' "$1" "$2"
+}
+
 fluxkit_cmd_help() {
   cat <<EOF
 fluxkit $FLUXKIT_VERSION — repo-local Flux setup for git projects
@@ -1883,10 +2188,10 @@ EOF
   fluxkit_help_row "fluxkit init [-e | --external] [repo|branch]" "Initialize external Flux state (default: repo)"
   fluxkit_help_row "fluxkit ui up" "Start Flux UI/API for the current repo/branch"
   fluxkit_help_row "fluxkit ui down" "Stop the current repo/branch UI"
-  fluxkit_help_row "fluxkit ui down [-t | --target] CONTAINER" "Stop one listed Docker UI container"
-  fluxkit_help_row "fluxkit ui down [-a | --all]" "Stop all running Fluxkit Docker UI containers"
+  fluxkit_help_row "fluxkit ui down [-t | --target] CONTAINER" "Stop one listed Fluxkit UI container"
+  fluxkit_help_row "fluxkit ui down [-a | --all]" "Stop all running Fluxkit UI containers"
   fluxkit_help_row "fluxkit ui status" "Show UI runtime status"
-  fluxkit_help_row "fluxkit ui list" "List running Fluxkit Docker UI containers"
+  fluxkit_help_row "fluxkit ui list" "List running Fluxkit UI containers"
   fluxkit_help_row "fluxkit port" "Show preferred and running ports"
   fluxkit_help_row "fluxkit mcp" "Run MCP server for the current repo/branch"
   fluxkit_help_row "fluxkit configured" "Report whether Fluxkit is configured for this repo"
@@ -1900,15 +2205,19 @@ EOF
   cat <<EOF
 
 Environment:
-  FLUXKIT_PORT_BASE         Base port for hash-based assignment (default: 42000)
-  FLUXKIT_PORT_SPAN         Port range span (default: 1000)
-  FLUXKIT_STATE_MODE        Force state mode: local or external
-  FLUXKIT_EXTERNAL_SCOPE    Force external scope: branch or repo
-  FLUXKIT_FLUX_CMD          Override flux CLI path (for testing)
-  FLUXKIT_DOCKER_CMD        Override docker path (for testing)
-  FLUXKIT_UI_BACKEND        UI backend: docker (default, Kanban UI) or cli (API only)
+EOF
+  fluxkit_help_env_row "FLUXKIT_PORT_BASE" "Base port for hash-based assignment (default: 42000)"
+  fluxkit_help_env_row "FLUXKIT_PORT_SPAN" "Port range span (default: 1000)"
+  fluxkit_help_env_row "FLUXKIT_STATE_MODE" "Force state mode: local or external"
+  fluxkit_help_env_row "FLUXKIT_EXTERNAL_SCOPE" "Force external scope: branch or repo"
+  fluxkit_help_env_row "FLUXKIT_FLUX_CMD" "Override flux CLI path"
+  fluxkit_help_env_row "FLUXKIT_CONTAINER_CMD" "Override container engine path"
+  fluxkit_help_env_row "FLUXKIT_CONTAINER_IMAGE" "Override container image (default: $FLUX_CONTAINER_IMAGE)"
+  fluxkit_help_env_row "FLUXKIT_CONTAINER_VOLUME_SUFFIX" "Append mount suffix, e.g. :Z for Podman SELinux hosts"
+  fluxkit_help_env_row "FLUXKIT_UI_BACKEND" "UI backend: container (default, Kanban UI) or cli (API only)"
+  cat <<EOF
 
-Requires: git, Docker ($FLUX_DOCKER_IMAGE) for Kanban UI; Docker also used for MCP
+Requires: git, Docker or Podman ($FLUX_CONTAINER_IMAGE) for Kanban UI; also used for MCP
 Docs: https://github.com/sirsjg/flux
 EOF
 }

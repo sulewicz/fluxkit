@@ -29,8 +29,8 @@ cp fluxkit ~/bin/fluxkit   # or /usr/local/bin/fluxkit
 Requirements:
 
 - `git`
-- [Docker](https://www.docker.com/) (`sirsjg/flux-mcp:latest`) for the Kanban web UI — required for `fluxkit ui up`
-- Docker is also used for MCP when the UI is not running
+- Docker or Podman (`sirsjg/flux-mcp:latest`) for the Kanban web UI — required for `fluxkit ui up`
+- The container engine is also used for MCP when the UI is not running
 
 ## Quickstart
 
@@ -52,10 +52,10 @@ fluxkit ui up
 | `fluxkit init -e [repo\|branch]` | Create or update external Flux files and home MCP config |
 | `fluxkit ui up` | Start Flux UI/API for this repo |
 | `fluxkit ui down` | Stop the server started by fluxkit |
-| `fluxkit ui down -t CONTAINER` | Stop a listed Fluxkit Docker UI container |
-| `fluxkit ui down -a` | Stop all running Fluxkit Docker UI containers |
+| `fluxkit ui down -t CONTAINER` | Stop a listed Fluxkit UI container |
+| `fluxkit ui down -a` | Stop all running Fluxkit UI containers |
 | `fluxkit ui status` | Show running/stopped state and ports |
-| `fluxkit ui list` | List running Fluxkit Docker UI containers |
+| `fluxkit ui list` | List running Fluxkit UI containers |
 | `fluxkit port` | Print repo root, preferred port, and running URL |
 | `fluxkit mcp` | Run the repo-aware MCP server for the current repo/branch |
 | `fluxkit configured` | Report whether Fluxkit is configured for this repo/branch |
@@ -72,7 +72,7 @@ After `fluxkit init`:
   config.json        # Fluxkit + UI settings (commit this)
   project.json       # Project identity hint (commit this)
   runtime.env        # Generated at runtime (gitignored)
-  ui.log             # UI/docker logs (gitignored)
+  ui.log             # UI/container logs (gitignored)
   bin/
     mcp              # MCP launcher for editors
 .cursor/
@@ -164,7 +164,7 @@ Those entries run:
 fluxkit mcp
 ```
 
-`fluxkit mcp` resolves the current git repository and branch from the editor's working directory, then connects to the matching external board. If the UI/API for that repo is running, it uses remote MCP mode; otherwise it falls back to direct JSON-backed MCP via Docker.
+`fluxkit mcp` resolves the current git repository and branch from the editor's working directory, then connects to the matching external board. If the UI/API for that repo is running, it uses remote MCP mode; otherwise it falls back to direct JSON-backed MCP via the configured container engine.
 
 External mode also adds a managed block to `~/AGENTS.md` telling agents to use Fluxkit work tracking only when it is configured for the current repository.
 
@@ -192,7 +192,7 @@ If the preferred port is busy, fluxkit probes `preferred+1`, `preferred+2`, … 
 
 ## UI server
 
-`fluxkit ui up` starts the **Kanban web UI** via Docker:
+`fluxkit ui up` starts the **Kanban web UI** via Docker or Podman:
 
 ```text
 sirsjg/flux-mcp:latest  →  bun packages/server/dist/index.js
@@ -201,6 +201,19 @@ sirsjg/flux-mcp:latest  →  bun packages/server/dist/index.js
 Your repo is mounted so the board uses `.flux/data.json`.
 
 Set `FLUXKIT_UI_BACKEND=cli` only if you want API-only mode (`flux serve` via npm — no web UI).
+
+Fluxkit uses `FLUXKIT_CONTAINER_CMD` when set, otherwise it tries `docker` and then `podman`:
+
+```bash
+export FLUXKIT_CONTAINER_CMD=podman
+export FLUXKIT_CONTAINER_IMAGE=sirsjg/flux-mcp:latest
+```
+
+On SELinux hosts where Podman bind mounts need relabeling, append the mount suffix:
+
+```bash
+export FLUXKIT_CONTAINER_VOLUME_SUFFIX=:Z
+```
 
 Runtime state is written to `.flux/runtime.env`:
 
@@ -215,16 +228,16 @@ FLUX_REPO_ROOT=<absolute repo root>
 
 `fluxkit ui up` and `fluxkit ui down` use the Fluxkit setup resolved from the current git repository and branch. No target is needed for local, repo-scoped, or branch-scoped state.
 
-To inspect and stop Docker UI containers globally, even after a branch has been deleted or an external branch state path is no longer active:
+To inspect and stop UI containers globally, even after a branch has been deleted or an external branch state path is no longer active:
 
 ```bash
 fluxkit ui list
 fluxkit ui down -a
 ```
 
-`fluxkit ui down -a` stops running Docker containers with Fluxkit's managed container name pattern. It does not discover API-only `FLUXKIT_UI_BACKEND=cli` processes.
+`fluxkit ui down -a` stops running containers with Fluxkit's generated name pattern. It does not discover API-only `FLUXKIT_UI_BACKEND=cli` processes.
 
-For `fluxkit ui down`, `-t`/`--target` accepts the Docker ID in the `CONTAINER` column from `fluxkit ui list`. It also accepts the generated Fluxkit `NAME` value for compatibility. Both forms can be run outside a git repository, and both require the container to have Fluxkit's managed Docker label:
+For `fluxkit ui down`, `-t`/`--target` accepts the container ID in the `CONTAINER` column from `fluxkit ui list`. It also accepts the generated Fluxkit `NAME` value. Both forms can be run outside a git repository:
 
 ```bash
 fluxkit ui down -t 1a2b3c4d5e6f
@@ -260,11 +273,17 @@ Run Codex from the repository root so `.flux/bin/mcp` resolves.
 Repo-local mode creates `.flux/bin/mcp`:
 
 1. If `.flux/runtime.env` exists and the UI/API is healthy → connect via `FLUX_SERVER` (remote MCP mode)
-2. Otherwise → fall back to direct JSON-backed MCP via Docker (`sirsjg/flux-mcp:latest`) scoped to `.flux/data.json`
+2. Otherwise → fall back to direct JSON-backed MCP via Docker or Podman (`sirsjg/flux-mcp:latest`) scoped to `.flux/data.json`
 
 MCP always targets this repository's board, not global Flux state.
 
 External mode uses the global `fluxkit mcp` command instead of a repo-local launcher. It resolves the active repo/branch and targets the corresponding external `.flux/data.json`.
+
+When `fluxkit mcp` is started by an MCP client in a repository that has not
+been initialized with Fluxkit, it starts a disabled no-op MCP server instead of
+failing the startup handshake. This keeps global external-mode editor config
+safe for projects that do not use Fluxkit. Run `fluxkit configured` to check
+whether the current repository has an active board.
 
 ## AGENTS.md managed block
 
@@ -312,18 +331,18 @@ Use the repo-local Flux board as the project manager. Keep tasks focused and cur
 
 | Issue | Fix |
 |-------|-----|
-| `Web UI not found` at the printed URL | Stop API-only server: `fluxkit ui down`, fix `docker info`, then `fluxkit ui up` |
+| `Web UI not found` at the printed URL | Stop API-only server: `fluxkit ui down`, fix `docker info` or `podman info`, then `fluxkit ui up` |
 | `docker-credential-desktop` errors on pull | Edit `~/.docker/config.json` and remove or fix `credsStore` (use `"credStore": ""` or install the helper) |
 | `EACCES` in `.flux/ui.log` | Fixed in current fluxkit (runs container as your uid); update script and retry |
-| `flux CLI not found` | `npm install -g flux-tasks`, or use Docker-only with `FLUXKIT_UI_BACKEND=docker` |
-| MCP fails without UI | Install Docker; image `sirsjg/flux-mcp:latest` is pulled on first use |
+| `flux CLI not found` | `npm install -g flux-tasks`, or use the container backend with `FLUXKIT_UI_BACKEND=container` |
+| MCP fails without UI | Install Docker or Podman; image `sirsjg/flux-mcp:latest` is pulled on first use |
 | Port in use | Run `fluxkit port`; fluxkit picks the next free port in range |
 | `doctor` fails on AGENTS.md | Ensure both managed block markers exist in pairs |
 | Wrong Flux board | Confirm you opened the correct repo; each repo has its own `.flux/data.json` |
 
 ## Limitations
 
-- MCP via Docker requires the Flux Docker image; the npm `flux-tasks` package requires Bun to run `flux serve`
+- MCP via container engine requires the Flux container image; the npm `flux-tasks` package requires Bun to run `flux serve`
 - `flux serve` binds to localhost; there is no `--host` flag in current Flux CLI
 - Port collision detection uses TCP probes; race conditions are possible but rare
 - Codex/Cursor config merging for pre-existing files is best-effort (python3 helps merge Cursor JSON)

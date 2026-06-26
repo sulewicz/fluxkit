@@ -11,7 +11,7 @@ FAIL=0
 ORIG_HOME="${HOME:-}"
 ORIG_CODEX_HOME_SET=0
 ORIG_CODEX_HOME=""
-if [[ -v CODEX_HOME ]]; then
+if [[ "${CODEX_HOME+x}" == "x" ]]; then
   ORIG_CODEX_HOME_SET=1
   ORIG_CODEX_HOME="$CODEX_HOME"
 fi
@@ -130,14 +130,18 @@ MOCK
   chmod +x "$bindir/flux"
 }
 
-setup_mock_docker() {
+setup_mock_container() {
   local bindir="$1"
+  local command_name="${2:-engine}"
   mkdir -p "$bindir"
-  cat >"$bindir/docker" <<'MOCK'
+  cat >"$bindir/$command_name" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
   info)
+    if [[ "${MOCK_CONTAINER_INFO_FAIL_CMDS:-}" == *"|$(basename "$0")|"* ]]; then
+      exit 1
+    fi
     exit 0
     ;;
   ps)
@@ -157,10 +161,13 @@ case "${1:-}" in
           ;;
       esac
     done
-    if [[ "$format" == *'{{.Label "fluxkit.managed"}}'* && "$format" != *"{{.Ports}}"* ]]; then
-      [[ -n "${MOCK_DOCKER_PS_TARGETS:-}" ]] && printf '%s\n' "$MOCK_DOCKER_PS_TARGETS"
+    if [[ -n "${MOCK_CONTAINER_PS_FORMAT_LOG:-}" ]]; then
+      printf '%s\n' "$format" >>"$MOCK_CONTAINER_PS_FORMAT_LOG"
+    fi
+    if [[ "$format" == *".ID"* && "$format" == *".Names"* && "$format" != *".Ports"* ]]; then
+      [[ -n "${MOCK_CONTAINER_PS_TARGETS:-}" ]] && printf '%s\n' "$MOCK_CONTAINER_PS_TARGETS"
     else
-      [[ -n "${MOCK_DOCKER_PS_ROWS:-}" ]] && printf '%s\n' "$MOCK_DOCKER_PS_ROWS"
+      [[ -n "${MOCK_CONTAINER_PS_ROWS:-}" ]] && printf '%s\n' "$MOCK_CONTAINER_PS_ROWS"
     fi
     exit 0
     ;;
@@ -174,21 +181,37 @@ case "${1:-}" in
     target="${1:-}"
     case "$format" in
       "{{.State.Running}}")
-        if [[ "${MOCK_DOCKER_RUNNING_TARGETS:-}" == *"|$target|"* ]]; then
+        if [[ "${MOCK_CONTAINER_RUNNING_TARGETS:-}" == *"|$target|"* ]]; then
           echo true
         else
           echo false
         fi
         ;;
-      "{{ index .Config.Labels \"fluxkit.managed\" }}")
-        if [[ "${MOCK_DOCKER_MANAGED_TARGETS:-}" == *"|$target|"* ]]; then
-          echo true
-        else
-          echo ""
-        fi
+      "{{ index .Config.Labels "*)
+        label="${format#*\"}"
+        label="${label%%\"*}"
+        found=""
+        while IFS=$'\t' read -r label_target label_name label_value; do
+          if [[ "$label_target" == "$target" && "$label_name" == "$label" ]]; then
+            found="$label_value"
+            break
+          fi
+        done <<< "${MOCK_CONTAINER_LABELS:-}"
+        echo "$found"
+        ;;
+      "{{.Name}}")
+        found=""
+        while IFS=$'\t' read -r name_target name_value; do
+          if [[ "$name_target" == "$target" ]]; then
+            found="$name_value"
+            break
+          fi
+        done <<< "${MOCK_CONTAINER_NAMES:-}"
+        [[ -n "$found" ]] || found="$target"
+        echo "/$found"
         ;;
       *)
-        if [[ -n "$target" && "${MOCK_DOCKER_INSPECT_TARGETS:-}" == *"|$target|"* ]]; then
+        if [[ -n "$target" && "${MOCK_CONTAINER_INSPECT_TARGETS:-}" == *"|$target|"* ]]; then
           echo "{}"
         else
           exit 1
@@ -202,8 +225,8 @@ case "${1:-}" in
     if [[ "${1:-}" == "-f" ]]; then
       shift
     fi
-    if [[ -n "${MOCK_DOCKER_RM_LOG:-}" ]]; then
-      printf '%s\n' "$@" >>"$MOCK_DOCKER_RM_LOG"
+    if [[ -n "${MOCK_CONTAINER_RM_LOG:-}" ]]; then
+      printf '%s %s\n' "$(basename "$0")" "$*" >>"$MOCK_CONTAINER_RM_LOG"
     fi
     exit 0
     ;;
@@ -215,10 +238,10 @@ case "${1:-}" in
     exit 0
     ;;
 esac
-echo "mock docker: unknown args: $*" >&2
+echo "mock container: unknown args: $*" >&2
 exit 1
 MOCK
-  chmod +x "$bindir/docker"
+  chmod +x "$bindir/$command_name"
 }
 
 FLUXKIT_NO_MAIN=1
@@ -293,6 +316,32 @@ popd >/dev/null
 rm -rf "$TMP"
 TMP=""
 
+echo "== container engine discovery =="
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_container "$MOCK_BIN" podman
+OLD_PATH="$PATH"
+PATH="$MOCK_BIN"
+found_container_cmd="$(fluxkit_find_container_cmd)"
+PATH="$OLD_PATH"
+assert_eq "$found_container_cmd" "$MOCK_BIN/podman" "podman is discovered when docker is unavailable"
+rm -rf "$TMP"
+TMP=""
+
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_container "$MOCK_BIN" docker
+setup_mock_container "$MOCK_BIN" podman
+OLD_PATH="$PATH"
+PATH="$MOCK_BIN:$OLD_PATH"
+export MOCK_CONTAINER_INFO_FAIL_CMDS="|docker|"
+found_container_cmd="$(fluxkit_find_container_cmd)"
+PATH="$OLD_PATH"
+assert_eq "$found_container_cmd" "$MOCK_BIN/podman" "podman is discovered when docker is installed but unavailable"
+rm -rf "$TMP"
+TMP=""
+unset MOCK_CONTAINER_INFO_FAIL_CMDS
+
 echo "== idempotent init =="
 TMP="$(new_work_dir)"
 MOCK_BIN="$TMP/bin"
@@ -305,6 +354,8 @@ run_fluxkit init
 assert_file_exists ".flux/data.json"
 assert_file_exists ".flux/config.json"
 assert_file_exists ".flux/project.json"
+assert_contains "$(cat .flux/bin/mcp)" "for candidate in docker podman" "generated mcp launcher discovers docker or podman"
+assert_contains "$(cat .flux/bin/mcp)" "FLUXKIT_CONTAINER_VOLUME_SUFFIX" "generated mcp launcher supports container volume suffix"
 configured_output="$(run_fluxkit configured)"
 assert_contains "$configured_output" "configured: yes" "configured reports local setup"
 assert_contains "$configured_output" "mode: local" "configured reports local mode"
@@ -381,9 +432,9 @@ echo "== external branch-scoped init =="
 TMP="$(new_work_dir)"
 MOCK_BIN="$TMP/bin"
 setup_mock_flux "$MOCK_BIN"
-setup_mock_docker "$MOCK_BIN"
+setup_mock_container "$MOCK_BIN"
 export FLUXKIT_FLUX_CMD="$MOCK_BIN/flux"
-export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
+export FLUXKIT_CONTAINER_CMD="$MOCK_BIN/engine"
 export HOME="$TMP/home"
 export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_STATE_HOME="$HOME/.local/state"
@@ -399,6 +450,7 @@ else
 fi
 data_main="$(fluxkit_data_file)"
 port_main="$(fluxkit_preferred_port)"
+initial_branch="$(fluxkit_branch_name)"
 assert_file_exists "$data_main" "external main branch data exists"
 assert_file_exists "$HOME/.codex/config.toml" "global codex config exists"
 assert_file_exists "$HOME/.cursor/mcp.json" "global cursor mcp exists"
@@ -414,9 +466,11 @@ assert_contains "$(cat "$HOME/.codex/config.toml")" 'args = ["mcp"]' "global cod
 assert_contains "$(cat "$HOME/.cursor/mcp.json")" '"mcp"' "global cursor uses fluxkit mcp"
 assert_contains "$(cat "$HOME/AGENTS.md")" "BEGIN FLUXKIT GLOBAL MANAGED BLOCK" "home agents global block"
 assert_contains "$(cat "$HOME/AGENTS.md")" "fluxkit configured" "home agents tells agents to check configured status"
+mcp_output="$(run_fluxkit mcp)"
+assert_eq "$mcp_output" "mock-container" "external configured mcp starts real container path"
 branch_index=1
 while true; do
-  git checkout -q master
+  git checkout -q "$initial_branch"
   git checkout -qb "feature/work-$branch_index"
   run_fluxkit init -e branch
   data_feature="$(fluxkit_data_file)"
@@ -443,7 +497,7 @@ else
 fi
 assert_file_exists "$data_feature" "external feature branch data exists"
 feature_container="$(fluxkit_ui_container_name)"
-git checkout -q master
+git checkout -q "$initial_branch"
 main_container="$(fluxkit_ui_container_name)"
 git checkout -q "feature/work-$branch_index"
 if [[ "$main_container" != "$feature_container" ]]; then
@@ -461,15 +515,15 @@ popd >/dev/null
 rm -rf "$TMP"
 TMP=""
 restore_user_env
-unset FLUXKIT_DOCKER_CMD
+unset FLUXKIT_CONTAINER_CMD
 
 echo "== external repo-scoped init =="
 TMP="$(new_work_dir)"
 MOCK_BIN="$TMP/bin"
 setup_mock_flux "$MOCK_BIN"
-setup_mock_docker "$MOCK_BIN"
+setup_mock_container "$MOCK_BIN"
 export FLUXKIT_FLUX_CMD="$MOCK_BIN/flux"
-export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
+export FLUXKIT_CONTAINER_CMD="$MOCK_BIN/engine"
 export HOME="$TMP/home"
 export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_STATE_HOME="$HOME/.local/state"
@@ -528,7 +582,25 @@ popd >/dev/null
 rm -rf "$TMP"
 TMP=""
 restore_user_env
-unset FLUXKIT_DOCKER_CMD
+unset FLUXKIT_CONTAINER_CMD
+
+echo "== ui startup clears existing Fluxkit container name =="
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_container "$MOCK_BIN"
+export FLUXKIT_CONTAINER_CMD="$MOCK_BIN/engine"
+export MOCK_CONTAINER_RM_LOG="$TMP/rm.log"
+new_git_repo "$TMP/project"
+pushd "$TMP/project" >/dev/null
+run_fluxkit init >/dev/null
+container_name="$(fluxkit_ui_container_name)"
+export MOCK_CONTAINER_INSPECT_TARGETS="|$container_name|"
+fluxkit_remove_existing_container "$container_name" "$MOCK_BIN/engine"
+assert_contains "$(cat "$MOCK_CONTAINER_RM_LOG")" "$container_name" "startup cleanup removes existing Fluxkit container name"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+unset FLUXKIT_CONTAINER_CMD MOCK_CONTAINER_INSPECT_TARGETS MOCK_CONTAINER_RM_LOG
 
 echo "== configured before init =="
 TMP="$(new_work_dir)"
@@ -543,48 +615,79 @@ popd >/dev/null
 rm -rf "$TMP"
 TMP=""
 
+echo "== disabled mcp for unconfigured repos =="
+TMP="$(new_work_dir)"
+new_git_repo "$TMP/project"
+pushd "$TMP/project" >/dev/null
+mcp_input=$'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}\n{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+mcp_output="$(printf '%s' "$mcp_input" | run_fluxkit mcp)"
+assert_contains "$mcp_output" '"serverInfo":{"name":"fluxkit-disabled","version":"' "unconfigured repo mcp initializes disabled server"
+assert_contains "$mcp_output" '"tools":[]' "unconfigured repo mcp advertises no tools"
+assert_contains "$mcp_output" "Fluxkit is not initialized for this repo/branch" "unconfigured repo mcp explains disabled state"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+
+TMP="$(new_work_dir)"
+mkdir -p "$TMP/not-git"
+pushd "$TMP/not-git" >/dev/null
+mcp_output="$(printf '%s' "$mcp_input" | env GIT_CEILING_DIRECTORIES="$WORK_ROOT" "$FLUXKIT" mcp)"
+assert_contains "$mcp_output" '"serverInfo":{"name":"fluxkit-disabled","version":"' "non-git mcp initializes disabled server"
+assert_contains "$mcp_output" "not inside a git repository" "non-git mcp explains disabled state"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+
 echo "== global UI container management =="
 TMP="$(new_work_dir)"
 MOCK_BIN="$TMP/bin"
-setup_mock_docker "$MOCK_BIN"
-export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
-export MOCK_DOCKER_PS_ROWS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\t127.0.0.1:42001->42001/tcp\ttrue\texternal\tbranch\told-branch\t/repo-a\t/data-a\ncccccccccccc\tfluxkit-cccccccccccc\t127.0.0.1:42003->42003/tcp\tfalse\texternal\tbranch\told-branch\t/repo-c\t/data-c\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\t127.0.0.1:42002->42002/tcp\ttrue\tlocal\t\tmain\t/repo-b\t/data-b\nshortshort12\tfluxkit-short\t127.0.0.1:42004->42004/tcp\ttrue\tlocal\t\tmain\t/repo-d\t/data-d\nnotflux12345\tnot-fluxkit\t127.0.0.1:43000->43000/tcp\ttrue\t\t\t\t\t'
-export MOCK_DOCKER_PS_TARGETS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\ttrue\ncccccccccccc\tfluxkit-cccccccccccc\tfalse\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\ttrue\nshortshort12\tfluxkit-short\ttrue\nnotflux12345\tnot-fluxkit\ttrue'
-export MOCK_DOCKER_MANAGED_TARGETS="|aaaaaaaaaaaa|fluxkit-aaaaaaaaaaaa|bbbbbbbbbbbb|fluxkit-bbbbbbbbbbbb|"
-export MOCK_DOCKER_RM_LOG="$TMP/rm.log"
+setup_mock_container "$MOCK_BIN"
+export FLUXKIT_CONTAINER_CMD="$MOCK_BIN/engine"
+export MOCK_CONTAINER_PS_ROWS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\t127.0.0.1:42001->42001/tcp\ncccccccccccc\tfluxkit-cccccccccccc\t127.0.0.1:42003->42003/tcp\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\t127.0.0.1:42002->42002/tcp\nshortshort12\tfluxkit-short\t127.0.0.1:42004->42004/tcp\nnotflux12345\tnot-fluxkit\t127.0.0.1:43000->43000/tcp'
+export MOCK_CONTAINER_PS_TARGETS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\ncccccccccccc\tfluxkit-cccccccccccc\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\nshortshort12\tfluxkit-short\nnotflux12345\tnot-fluxkit'
+export MOCK_CONTAINER_NAMES=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\ncccccccccccc\tfluxkit-cccccccccccc\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\ndddddddddddd\tnot-fluxkit\nshortshort12\tfluxkit-short\nnotflux12345\tnot-fluxkit'
+export MOCK_CONTAINER_LABELS=$'aaaaaaaaaaaa\tfluxkit.state_mode\texternal\naaaaaaaaaaaa\tfluxkit.external_scope\tbranch\naaaaaaaaaaaa\tfluxkit.branch\told-branch\naaaaaaaaaaaa\tfluxkit.repo_root\t/repo-a\naaaaaaaaaaaa\tfluxkit.data_file\t/data-a\nbbbbbbbbbbbb\tfluxkit.state_mode\tlocal\nbbbbbbbbbbbb\tfluxkit.branch\tmain\nbbbbbbbbbbbb\tfluxkit.repo_root\t/repo-b\nbbbbbbbbbbbb\tfluxkit.data_file\t/data-b'
+export MOCK_CONTAINER_RM_LOG="$TMP/rm.log"
+export MOCK_CONTAINER_PS_FORMAT_LOG="$TMP/ps-format.log"
 pushd "$TMP" >/dev/null
 list_output="$(run_fluxkit ui list)"
 assert_contains "$list_output" "aaaaaaaaaaaa" "ui list includes first fluxkit container ID"
 assert_contains "$list_output" "fluxkit-aaaaaaaaaaaa" "ui list includes first fluxkit container name"
 assert_contains "$list_output" "old-branch" "ui list includes branch label"
 assert_contains "$list_output" "fluxkit-bbbbbbbbbbbb" "ui list includes second fluxkit container"
+assert_contains "$list_output" "fluxkit-cccccccccccc" "ui list includes valid Fluxkit-looking container"
 assert_not_contains "$list_output" "not-fluxkit" "ui list excludes non-matching containers"
 assert_not_contains "$list_output" "fluxkit-short" "ui list excludes invalid fluxkit names"
-assert_not_contains "$list_output" "fluxkit-cccccccccccc" "ui list excludes unmanaged fluxkit-looking containers"
 run_fluxkit ui down -t aaaaaaaaaaaa >/dev/null
-rm_log="$(cat "$MOCK_DOCKER_RM_LOG")"
+rm_log="$(cat "$MOCK_CONTAINER_RM_LOG")"
 assert_contains "$rm_log" "aaaaaaaaaaaa" "ui down -t stops selected CONTAINER ID"
 assert_not_contains "$rm_log" "bbbbbbbbbbbb" "ui down -t does not stop other containers"
 run_fluxkit ui down -t fluxkit-bbbbbbbbbbbb >/dev/null
-rm_log="$(cat "$MOCK_DOCKER_RM_LOG")"
+rm_log="$(cat "$MOCK_CONTAINER_RM_LOG")"
 assert_contains "$rm_log" "fluxkit-bbbbbbbbbbbb" "ui down -t accepts selected Fluxkit NAME value"
+run_fluxkit ui down -t cccccccccccc >/dev/null
+rm_log="$(cat "$MOCK_CONTAINER_RM_LOG")"
+assert_contains "$rm_log" "cccccccccccc" "ui down -t accepts listed Fluxkit-looking container ID"
 set +e
-run_fluxkit ui down -t cccccccccccc >/dev/null 2>&1
+run_fluxkit ui down -t dddddddddddd >/dev/null 2>&1
 rc=$?
 set -e
-assert_eq "$rc" "1" "ui down -t refuses unmanaged fluxkit-looking container"
-: >"$MOCK_DOCKER_RM_LOG"
+assert_eq "$rc" "1" "ui down -t refuses hex ID whose container name is not Fluxkit"
+: >"$MOCK_CONTAINER_RM_LOG"
 run_fluxkit ui down -a >/dev/null
-rm_log="$(cat "$MOCK_DOCKER_RM_LOG")"
+rm_log="$(cat "$MOCK_CONTAINER_RM_LOG")"
 assert_contains "$rm_log" "aaaaaaaaaaaa" "ui down --all stops first fluxkit container"
 assert_contains "$rm_log" "bbbbbbbbbbbb" "ui down --all stops second fluxkit container"
+assert_contains "$rm_log" "cccccccccccc" "ui down --all stops third valid fluxkit container"
 assert_not_contains "$rm_log" "not-fluxkit" "ui down --all skips non-matching containers"
 assert_not_contains "$rm_log" "fluxkit-short" "ui down --all skips invalid fluxkit names"
-assert_not_contains "$rm_log" "cccccccccccc" "ui down --all skips unmanaged fluxkit-looking containers"
+ps_format_log="$(cat "$MOCK_CONTAINER_PS_FORMAT_LOG")"
+assert_contains "$ps_format_log" '{{printf "%s\t%s\t%s" .ID .Names .Ports}}' "ui list uses portable container ps row format"
+assert_contains "$ps_format_log" '{{printf "%s\t%s" .ID .Names}}' "ui down --all uses portable container ps target format"
 popd >/dev/null
 rm -rf "$TMP"
 TMP=""
-unset FLUXKIT_DOCKER_CMD MOCK_DOCKER_PS_ROWS MOCK_DOCKER_PS_TARGETS MOCK_DOCKER_MANAGED_TARGETS MOCK_DOCKER_RM_LOG
+unset FLUXKIT_CONTAINER_CMD MOCK_CONTAINER_PS_ROWS MOCK_CONTAINER_PS_TARGETS MOCK_CONTAINER_NAMES MOCK_CONTAINER_LABELS MOCK_CONTAINER_RM_LOG MOCK_CONTAINER_PS_FORMAT_LOG
 
 echo "== AGENTS.md creation when missing =="
 TMP="$(new_work_dir)"
@@ -684,13 +787,38 @@ popd >/dev/null
 rm -rf "$TMP"
 TMP=""
 
+echo "== runtime container engine persistence =="
+TMP="$(new_work_dir)"
+MOCK_BIN="$TMP/bin"
+setup_mock_container "$MOCK_BIN" docker
+setup_mock_container "$MOCK_BIN" podman
+export MOCK_CONTAINER_RM_LOG="$TMP/rm.log"
+new_git_repo "$TMP/project"
+pushd "$TMP/project" >/dev/null
+run_fluxkit init >/dev/null
+container_name="$(fluxkit_ui_container_name)"
+export MOCK_CONTAINER_RUNNING_TARGETS="|$container_name|"
+fluxkit_write_runtime_env "$(fluxkit_preferred_port)" "" "container" "$container_name" "$MOCK_BIN/podman"
+assert_contains "$(cat .flux/runtime.env)" "FLUX_UI_CONTAINER_CMD=$MOCK_BIN/podman" "runtime.env persists container engine"
+OLD_PATH="$PATH"
+PATH="$MOCK_BIN:$OLD_PATH"
+run_fluxkit ui down >/dev/null
+PATH="$OLD_PATH"
+rm_log="$(cat "$MOCK_CONTAINER_RM_LOG")"
+assert_contains "$rm_log" "podman $container_name" "ui down uses persisted container engine"
+assert_not_contains "$rm_log" "docker $container_name" "ui down does not rediscover another ready engine"
+popd >/dev/null
+rm -rf "$TMP"
+TMP=""
+unset MOCK_CONTAINER_RM_LOG MOCK_CONTAINER_RUNNING_TARGETS
+
 echo "== doctor checks =="
 TMP="$(new_work_dir)"
 MOCK_BIN="$TMP/bin"
 setup_mock_flux "$MOCK_BIN"
-setup_mock_docker "$MOCK_BIN"
+setup_mock_container "$MOCK_BIN"
 export FLUXKIT_FLUX_CMD="$MOCK_BIN/flux"
-export FLUXKIT_DOCKER_CMD="$MOCK_BIN/docker"
+export FLUXKIT_CONTAINER_CMD="$MOCK_BIN/engine"
 new_git_repo "$TMP/project"
 pushd "$TMP/project" >/dev/null
 set +e
@@ -707,7 +835,7 @@ assert_eq "$rc" "0" "doctor passes after init"
 popd >/dev/null
 rm -rf "$TMP"
 TMP=""
-unset FLUXKIT_DOCKER_CMD
+unset FLUXKIT_CONTAINER_CMD
 
 echo "== safe ui down refuses unrelated PID =="
 TMP="$(new_work_dir)"
