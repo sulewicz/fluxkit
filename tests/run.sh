@@ -179,6 +179,21 @@ case "${1:-}" in
       shift 2
     fi
     target="${1:-}"
+    if [[ "$format" == *"fluxkit.state_mode"* && "$format" == *"fluxkit.data_file"* ]]; then
+      values=()
+      for label in fluxkit.state_mode fluxkit.external_scope fluxkit.branch fluxkit.repo_root fluxkit.data_file; do
+        found=""
+        while IFS=$'\t' read -r label_target label_name label_value; do
+          if [[ "$label_target" == "$target" && "$label_name" == "$label" ]]; then
+            found="$label_value"
+            break
+          fi
+        done <<< "${MOCK_CONTAINER_LABELS:-}"
+        values+=("$found")
+      done
+      printf '%s|%s|%s|%s|%s\n' "${values[@]}"
+      exit 0
+    fi
     case "$format" in
       "{{.State.Running}}")
         if [[ "${MOCK_CONTAINER_RUNNING_TARGETS:-}" == *"|$target|"* ]]; then
@@ -338,6 +353,13 @@ export MOCK_CONTAINER_INFO_FAIL_CMDS="|docker|"
 found_container_cmd="$(fluxkit_find_container_cmd)"
 PATH="$OLD_PATH"
 assert_eq "$found_container_cmd" "$MOCK_BIN/podman" "podman is discovered when docker is installed but unavailable"
+podman_user_args="$(fluxkit_container_user_args "$MOCK_BIN/podman")"
+docker_user_args="$(fluxkit_container_user_args "$MOCK_BIN/docker")"
+assert_contains "$podman_user_args" "--userns
+keep-id" "podman uses keep-id user namespace for bind mount writes"
+assert_contains "$podman_user_args" "--user
+$(id -u):$(id -g)" "podman still runs as the invoking uid/gid"
+assert_not_contains "$docker_user_args" "--userns" "docker does not receive podman-only user namespace flags"
 rm -rf "$TMP"
 TMP=""
 unset MOCK_CONTAINER_INFO_FAIL_CMDS
@@ -355,7 +377,10 @@ assert_file_exists ".flux/data.json"
 assert_file_exists ".flux/config.json"
 assert_file_exists ".flux/project.json"
 assert_contains "$(cat .flux/bin/mcp)" "for candidate in docker podman" "generated mcp launcher discovers docker or podman"
+assert_contains "$(cat .flux/bin/mcp)" "docker.io/sirsjg/flux-mcp:latest" "generated mcp launcher uses fully qualified default image"
+assert_contains "$(cat .flux/bin/mcp)" "--userns keep-id" "generated mcp launcher handles rootless podman bind mount writes"
 assert_contains "$(cat .flux/bin/mcp)" "FLUXKIT_CONTAINER_VOLUME_SUFFIX" "generated mcp launcher supports container volume suffix"
+assert_not_contains "$(grep -v '^[[:space:]]*#' .flux/bin/mcp)" "mapfile -t" "generated mcp launcher avoids Bash 4-only mapfile"
 configured_output="$(run_fluxkit configured)"
 assert_contains "$configured_output" "configured: yes" "configured reports local setup"
 assert_contains "$configured_output" "mode: local" "configured reports local mode"
@@ -646,14 +671,13 @@ export FLUXKIT_CONTAINER_CMD="$MOCK_BIN/engine"
 export MOCK_CONTAINER_PS_ROWS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\t127.0.0.1:42001->42001/tcp\ncccccccccccc\tfluxkit-cccccccccccc\t127.0.0.1:42003->42003/tcp\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\t127.0.0.1:42002->42002/tcp\nshortshort12\tfluxkit-short\t127.0.0.1:42004->42004/tcp\nnotflux12345\tnot-fluxkit\t127.0.0.1:43000->43000/tcp'
 export MOCK_CONTAINER_PS_TARGETS=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\ncccccccccccc\tfluxkit-cccccccccccc\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\nshortshort12\tfluxkit-short\nnotflux12345\tnot-fluxkit'
 export MOCK_CONTAINER_NAMES=$'aaaaaaaaaaaa\tfluxkit-aaaaaaaaaaaa\ncccccccccccc\tfluxkit-cccccccccccc\nbbbbbbbbbbbb\tfluxkit-bbbbbbbbbbbb\ndddddddddddd\tnot-fluxkit\nshortshort12\tfluxkit-short\nnotflux12345\tnot-fluxkit'
-export MOCK_CONTAINER_LABELS=$'aaaaaaaaaaaa\tfluxkit.state_mode\texternal\naaaaaaaaaaaa\tfluxkit.external_scope\tbranch\naaaaaaaaaaaa\tfluxkit.branch\told-branch\naaaaaaaaaaaa\tfluxkit.repo_root\t/repo-a\naaaaaaaaaaaa\tfluxkit.data_file\t/data-a\nbbbbbbbbbbbb\tfluxkit.state_mode\tlocal\nbbbbbbbbbbbb\tfluxkit.branch\tmain\nbbbbbbbbbbbb\tfluxkit.repo_root\t/repo-b\nbbbbbbbbbbbb\tfluxkit.data_file\t/data-b'
+export MOCK_CONTAINER_INSPECT_TARGETS="|fluxkit-bbbbbbbbbbbb|"
 export MOCK_CONTAINER_RM_LOG="$TMP/rm.log"
 export MOCK_CONTAINER_PS_FORMAT_LOG="$TMP/ps-format.log"
 pushd "$TMP" >/dev/null
 list_output="$(run_fluxkit ui list)"
 assert_contains "$list_output" "aaaaaaaaaaaa" "ui list includes first fluxkit container ID"
 assert_contains "$list_output" "fluxkit-aaaaaaaaaaaa" "ui list includes first fluxkit container name"
-assert_contains "$list_output" "old-branch" "ui list includes branch label"
 assert_contains "$list_output" "fluxkit-bbbbbbbbbbbb" "ui list includes second fluxkit container"
 assert_contains "$list_output" "fluxkit-cccccccccccc" "ui list includes valid Fluxkit-looking container"
 assert_not_contains "$list_output" "not-fluxkit" "ui list excludes non-matching containers"
@@ -687,7 +711,7 @@ assert_contains "$ps_format_log" '{{printf "%s\t%s" .ID .Names}}' "ui down --all
 popd >/dev/null
 rm -rf "$TMP"
 TMP=""
-unset FLUXKIT_CONTAINER_CMD MOCK_CONTAINER_PS_ROWS MOCK_CONTAINER_PS_TARGETS MOCK_CONTAINER_NAMES MOCK_CONTAINER_LABELS MOCK_CONTAINER_RM_LOG MOCK_CONTAINER_PS_FORMAT_LOG
+unset FLUXKIT_CONTAINER_CMD MOCK_CONTAINER_PS_ROWS MOCK_CONTAINER_PS_TARGETS MOCK_CONTAINER_NAMES MOCK_CONTAINER_INSPECT_TARGETS MOCK_CONTAINER_RM_LOG MOCK_CONTAINER_PS_FORMAT_LOG
 
 echo "== AGENTS.md creation when missing =="
 TMP="$(new_work_dir)"
@@ -805,7 +829,9 @@ PATH="$MOCK_BIN:$OLD_PATH"
 run_fluxkit ui down >/dev/null
 PATH="$OLD_PATH"
 rm_log="$(cat "$MOCK_CONTAINER_RM_LOG")"
-assert_contains "$rm_log" "podman $container_name" "ui down uses persisted container engine"
+assert_contains "$rm_log" "podman " "ui down uses persisted container engine"
+assert_contains "$rm_log" "$container_name" "ui down stops persisted container"
+assert_contains "$rm_log" "--time 0" "podman ui down kills immediately by default"
 assert_not_contains "$rm_log" "docker $container_name" "ui down does not rediscover another ready engine"
 popd >/dev/null
 rm -rf "$TMP"
@@ -906,6 +932,7 @@ assert_file_exists "$ROOT/LICENSE" "LICENSE file exists"
 assert_contains "$(head -20 "$FLUXKIT")" "SPDX-License-Identifier: GPL-3.0-or-later" "fluxkit SPDX header"
 assert_contains "$(cat "$ROOT/README.md")" "Does Fluxkit make my project GPL?" "README GPL clarification"
 assert_contains "$(cat "$ROOT/README.md")" "GPL-3.0-or-later" "README license identifier"
+assert_not_contains "$(grep -v '^[[:space:]]*#' "$FLUXKIT")" "mapfile -t" "fluxkit avoids Bash 4-only mapfile"
 
 echo "== repo root stays clean =="
 if [[ ! -d "$ROOT/.flux" && ! -d "$ROOT/.cursor" && ! -d "$ROOT/.codex" && ! -f "$ROOT/AGENTS.md" ]]; then

@@ -29,7 +29,7 @@ cp fluxkit ~/bin/fluxkit   # or /usr/local/bin/fluxkit
 Requirements:
 
 - `git`
-- Docker or Podman (`sirsjg/flux-mcp:latest`) for the Kanban web UI — required for `fluxkit ui up`
+- Docker or Podman (`docker.io/sirsjg/flux-mcp:latest`) for the Kanban web UI — required for `fluxkit ui up`
 - The container engine is also used for MCP when the UI is not running
 
 ## Quickstart
@@ -195,7 +195,7 @@ If the preferred port is busy, fluxkit probes `preferred+1`, `preferred+2`, … 
 `fluxkit ui up` starts the **Kanban web UI** via Docker or Podman:
 
 ```text
-sirsjg/flux-mcp:latest  →  bun packages/server/dist/index.js
+docker.io/sirsjg/flux-mcp:latest  →  bun packages/server/dist/index.js
 ```
 
 Your repo is mounted so the board uses `.flux/data.json`.
@@ -206,7 +206,7 @@ Fluxkit uses `FLUXKIT_CONTAINER_CMD` when set, otherwise it tries `docker` and t
 
 ```bash
 export FLUXKIT_CONTAINER_CMD=podman
-export FLUXKIT_CONTAINER_IMAGE=sirsjg/flux-mcp:latest
+export FLUXKIT_CONTAINER_IMAGE=docker.io/sirsjg/flux-mcp:latest
 ```
 
 On SELinux hosts where Podman bind mounts need relabeling, append the mount suffix:
@@ -273,7 +273,7 @@ Run Codex from the repository root so `.flux/bin/mcp` resolves.
 Repo-local mode creates `.flux/bin/mcp`:
 
 1. If `.flux/runtime.env` exists and the UI/API is healthy → connect via `FLUX_SERVER` (remote MCP mode)
-2. Otherwise → fall back to direct JSON-backed MCP via Docker or Podman (`sirsjg/flux-mcp:latest`) scoped to `.flux/data.json`
+2. Otherwise → fall back to direct JSON-backed MCP via Docker or Podman (`docker.io/sirsjg/flux-mcp:latest`) scoped to `.flux/data.json`
 
 MCP always targets this repository's board, not global Flux state.
 
@@ -335,7 +335,7 @@ Use the repo-local Flux board as the project manager. Keep tasks focused and cur
 | `docker-credential-desktop` errors on pull | Edit `~/.docker/config.json` and remove or fix `credsStore` (use `"credStore": ""` or install the helper) |
 | `EACCES` in `.flux/ui.log` | Fixed in current fluxkit (runs container as your uid); update script and retry |
 | `flux CLI not found` | `npm install -g flux-tasks`, or use the container backend with `FLUXKIT_UI_BACKEND=container` |
-| MCP fails without UI | Install Docker or Podman; image `sirsjg/flux-mcp:latest` is pulled on first use |
+| MCP fails without UI | Install Docker or Podman; image `docker.io/sirsjg/flux-mcp:latest` is pulled on first use |
 | Port in use | Run `fluxkit port`; fluxkit picks the next free port in range |
 | `doctor` fails on AGENTS.md | Ensure both managed block markers exist in pairs |
 | Wrong Flux board | Confirm you opened the correct repo; each repo has its own `.flux/data.json` |
